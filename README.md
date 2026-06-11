@@ -34,9 +34,13 @@ networking.
 Requires macOS / Apple Silicon and a Rust toolchain.
 
 ```sh
-cargo build --release
-cp target/release/rtr /usr/local/bin/   # or anywhere on PATH
+make                         # builds bin/rtr
+make install                 # installs to ~/.cargo/bin/rtr
+make install PREFIX=/usr/local
 ```
+
+The default install path is `~/.cargo/bin`; make sure it is on your `PATH`, or
+pass a different `PREFIX`.
 
 ## Quick Start
 
