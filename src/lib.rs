@@ -26,11 +26,57 @@ pub fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
+fn tracing_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_env("RTR_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+pub fn init_stderr_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_filter())
+        .with_writer(std::io::stderr)
+        .without_time()
+        .try_init();
+}
+
+/// Route tracing (including hudsucker's own spans/errors) to a file so the
+/// child process keeps a clean terminal. Best-effort: if the file can't be
+/// opened we simply don't capture proxy logs.
+pub fn init_file_tracing(path: &std::path::Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("rtr: could not open {} for logs: {e}", path.display());
+            return;
+        }
+    };
+    // `Arc<File>` writes through one shared fd: no per-event dup(2), and no
+    // panic path in the logging hot loop.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_filter())
+        .with_ansi(false)
+        .without_time()
+        .with_writer(std::sync::Arc::new(file))
+        .try_init();
+}
+
 /// Parse argv and dispatch the chosen subcommand.
 pub async fn run() -> Result<()> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let parsed = cli::parse_from(raw);
     let paths = Paths::from_env()?;
+
+    // `run` initialises tracing to a per-run file itself; all other commands
+    // log to stderr.
+    if !matches!(parsed.cmd, Cmd::Run { .. }) {
+        init_stderr_tracing();
+    }
 
     match parsed.cmd {
         Cmd::Init { force } => {
