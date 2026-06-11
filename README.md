@@ -174,6 +174,10 @@ Each run writes under `~/.local/state/rtr/runs/<tool>/<timestamp-pid>/`:
 `capture.jsonl` always stores the original header values. Request previews in
 `rtr.log` are redacted unless you run with `--log --show-secrets`.
 
+Interception is **host-scoped**: a tool intercepts only the hosts listed in its
+`config.toml` entry. Set `hosts = ["*"]` — or omit `hosts` — to intercept *all*
+of that tool's traffic (still only the spawned child, never system-wide).
+
 ## Docs
 
 - [docs/usage.md](docs/usage.md) — install, the codex walkthrough, full command
