@@ -4,12 +4,17 @@ pub mod ca;
 pub mod capture;
 pub mod cli;
 pub mod config;
+mod file_lock;
+pub mod import;
 pub mod keychain;
 pub mod paths;
 pub mod proxy;
 pub mod rewrite;
 pub mod runner;
+pub mod selection;
 pub mod state;
+pub mod tool_specs;
+pub mod usage;
 
 use std::path::PathBuf;
 
@@ -17,6 +22,7 @@ use anyhow::{Context, Result};
 
 use cli::{CaCmd, Cmd};
 use config::Config;
+use import::ConflictPolicy;
 use paths::Paths;
 use state::State;
 
@@ -74,7 +80,10 @@ pub async fn run() -> Result<()> {
 
     // `run` initialises tracing to a per-run file itself; all other commands
     // log to stderr.
-    if !matches!(parsed.cmd, Cmd::Run { .. }) {
+    if !matches!(
+        parsed.cmd,
+        Cmd::Run { .. } | Cmd::Claude(_) | Cmd::Codex(_) | Cmd::Capture { .. }
+    ) {
         init_stderr_tracing();
     }
 
@@ -86,7 +95,7 @@ pub async fn run() -> Result<()> {
             let ca = ca::load_or_generate(&paths.ca_cert(), &paths.ca_key())?;
             println!("CA ready at {}", ca.cert_path.display());
             println!("  fingerprint (SHA-256): {}", ca.fingerprint()?);
-            println!("Next: run `rtr trust` once, then `rtr codex`.");
+            println!("Next: run `rtr trust`, then `rtr capture codex --profile personal`.");
             Ok(())
         }
         Cmd::Run {
@@ -101,13 +110,76 @@ pub async fn run() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Claude(args) => {
+            let code = runner::run_subscription_tool(
+                &paths,
+                "claude",
+                args.profile.as_deref(),
+                args.preset.as_deref(),
+                &args.args,
+                args.show_secrets,
+                args.log,
+            )
+            .await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Cmd::Codex(args) => {
+            let code = runner::run_subscription_tool(
+                &paths,
+                "codex",
+                args.profile.as_deref(),
+                args.preset.as_deref(),
+                &args.args,
+                args.show_secrets,
+                args.log,
+            )
+            .await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Cmd::Capture { tool, profile } => {
+            let code = runner::capture_subscription_tool(&paths, &tool, &profile).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Cmd::Import {
+            tool,
+            profile,
+            from_capture,
+            force,
+            no_overwrite,
+            show_secrets,
+        } => {
+            let policy = if force {
+                ConflictPolicy::Force
+            } else if no_overwrite {
+                ConflictPolicy::Reject
+            } else {
+                ConflictPolicy::Prompt
+            };
+            import::run_import_profile(&paths, &tool, &profile, &from_capture, policy, show_secrets)
+        }
+        Cmd::Ls => import::run_list_profiles(&paths),
+        Cmd::Show {
+            target,
+            show_secrets,
+        } => import::run_show_profile(&paths, &target, show_secrets),
+        Cmd::Stats { today } => usage::print_stats(&paths, today),
         Cmd::Switch { first, second } => {
             let cfg = Config::load(&paths.config_file())?;
             let (tool, profile) = cfg.resolve_switch(&first, second.as_deref())?;
             let state_path = paths.state_file();
-            let mut st = State::load(&state_path)?;
-            st.set_active(&tool, &profile);
-            st.save(&state_path)?;
+            State::update_locked(&state_path, |st| {
+                st.set_active(&tool, &profile);
+                Ok(())
+            })?;
             println!("Switched {tool} -> {profile}");
             Ok(())
         }

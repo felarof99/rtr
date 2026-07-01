@@ -2,10 +2,9 @@
 
 ## Goal
 
-Intercept the HTTPS traffic of **one specific binary** (e.g. `codex` →
-`api.openai.com`) and rewrite its auth headers, so a user can switch between
-multiple subscriptions for that tool. macOS, Apple Silicon. Prefer per-binary
-scoping over system-wide routing.
+Intercept the HTTPS traffic of Claude Code or Codex and rewrite the auth bundle
+needed for one selected subscription profile. macOS, Apple Silicon. Prefer
+per-binary scoping over system-wide routing.
 
 ## Chosen approach: in-process MITM proxy, scoped to the spawned child
 
@@ -14,28 +13,29 @@ environment, it points the child at a local [`hudsucker`](https://crates.io/crat
 MITM HTTPS proxy via `HTTPS_PROXY`/`HTTP_PROXY` and scopes interception to that
 process alone — no routing tables, no VPN, no kernel/network extension.
 
-The proxy intercepts only the tool's configured **target hosts**; everything else
-the child talks to is blind-tunneled end-to-end (no forged certificate, nothing
-broken). For intercepted requests it records the original headers to a per-run
-capture file, then applies the active profile's header rewrites before
-forwarding upstream.
+The proxy intercepts only the tool's **target hosts**; everything else the child
+talks to is blind-tunneled end-to-end (no forged certificate, nothing broken).
+First-class Claude/Codex commands use built-in target hosts from their tool spec;
+legacy/custom `rtr run` tools use the configured hosts. For intercepted requests
+the proxy records the original headers to a per-run capture file, then applies
+the selected profile's header rewrites before forwarding upstream.
 
 TLS interception needs the child to trust a CA `rtr` mints locally. Two
 mechanisms, because tools differ (see the trust model below).
 
-Switching subscriptions is just flipping which profile is active; it applies on
-the next run.
+First-class `rtr claude` and `rtr codex` runs select a profile for one run:
+`--profile/-p` forces a profile, otherwise equal round-robin advances across
+enabled profiles. The lower-level `rtr run <tool>` path still supports the older
+active-profile model.
 
-### Why this fits `codex` specifically
+### Why this fits CLI clients
 
-The decision was grounded by probing the real `codex` 0.139.0 binary:
+The decision was grounded by probing real CLI clients:
 
-- It references `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` and contains
-  "tunneling HTTPS over proxy" → it honors proxy env vars (it's a `reqwest`
-  client). **Routing works.**
-- It links `rustls-platform-verifier` + `security-framework` + `SecTrustEvaluate`
-  → it validates server certs against the **macOS trust store**, not
-  `SSL_CERT_FILE`. **Trust requires the keychain** (`rtr trust`).
+- They honor `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`, so child-scoped
+  proxy env vars route their traffic through rtr.
+- Some clients validate server certs against the **macOS trust store**, not only
+  CA env vars. Those need one-time keychain trust (`rtr trust`).
 
 ## Trust model
 
@@ -66,9 +66,17 @@ with `rtr untrust`.
   `rtr run` still intercepts and records — this is the "discover the real
   Authorization header" mode the workflow starts from. Capture stores the
   *original* request; rewrites are applied afterward toward the upstream.
+- **Capture/import are separate.** `rtr capture <tool> --profile <name>` creates
+  evidence with no rewrites; `rtr import ... --from-capture ...` validates the
+  tool-specific auth bundle and stores the profile.
+- **Tool specs are first-class for Claude/Codex.** Claude imports
+  `Authorization` and keeps `x-organization-uuid` as metadata. Codex imports
+  both `Authorization` and `chatgpt-account-id`, while avoiding global cookie or
+  telemetry rewrites.
 - **Host-scoped interception by default** — named hosts protect unrelated/pinned
-  traffic and keep the forged-cert surface minimal. A tool opts into intercept-all
-  with `hosts = ["*"]` (or by omitting `hosts`); that still scopes to the spawned
+  traffic and keep the forged-cert surface minimal. First-class Claude/Codex
+  runs keep fixed runtime scopes; legacy/custom tools opt into intercept-all with
+  `hosts = ["*"]` (or by omitting `hosts`). That still scopes to the spawned
   child via proxy env vars — it is not system-wide interception.
 - **Secrets in a `0600` config.toml** (plaintext) — matches the requested
   ergonomics. Keychain-backed secret references are a future step.
@@ -89,6 +97,7 @@ with `rtr untrust`.
 
 ## Non-goals (v1)
 
-System-wide interception; live re-routing of an already-running process;
+Arbitrary third-party subscription onboarding; weighted profile selection;
+system-wide interception; live re-routing of an already-running process;
 response-body/WebSocket rewriting; path/method-scoped rules (host-scoped only);
 Keychain-backed secret storage; Linux/Windows.

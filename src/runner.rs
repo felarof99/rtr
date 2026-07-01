@@ -21,8 +21,9 @@ use crate::config::{Config, Profile};
 use crate::paths::Paths;
 use crate::proxy::{self, RewriteHandler};
 use crate::rewrite::Rewrites;
+use crate::selection;
 use crate::state::State;
-use crate::{ca, keychain};
+use crate::{ca, keychain, tool_specs, usage};
 
 /// Environment injected into the child to scope interception to it alone.
 ///
@@ -33,7 +34,14 @@ pub fn proxy_env(port: u16, ca_cert: &Path) -> Vec<(String, String)> {
     let proxy_url = format!("http://127.0.0.1:{port}");
     let ca = ca_cert.to_string_lossy().into_owned();
     let mut env: Vec<(String, String)> = Vec::new();
-    for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+    for key in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
         env.push((key.to_string(), proxy_url.clone()));
     }
     for key in ["NO_PROXY", "no_proxy"] {
@@ -71,18 +79,37 @@ fn hosts_label(hosts: &[String]) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RunOutcome {
+    pub exit_code: i32,
+    pub capture_path: std::path::PathBuf,
+    pub log_path: std::path::PathBuf,
+    pub profile: Option<String>,
+    pub preset: Option<String>,
+}
+
+struct PreparedSubscriptionRun {
+    profile_name: String,
+    rewrites: Rewrites,
+    preset_name: Option<String>,
+    child_args: Vec<String>,
+}
+
 /// Resolve the active profile's rewrites, bailing if the active name is unknown.
-fn resolve_rewrites(cfg: &Config, st: &State, tool_name: &str) -> Result<(Option<String>, Rewrites)> {
+fn resolve_rewrites(
+    cfg: &Config,
+    st: &State,
+    tool_name: &str,
+) -> Result<(Option<String>, Rewrites)> {
     let tool = cfg.tool(tool_name)?;
     let active = st.active_for(tool_name, cfg);
-    let profile = match &active {
-        Some(name) => tool
-            .profiles
-            .get(name)
-            .cloned()
-            .with_context(|| format!("active profile '{name}' not found for tool '{tool_name}'"))?,
-        None => Profile::default(),
-    };
+    let profile =
+        match &active {
+            Some(name) => tool.profiles.get(name).cloned().with_context(|| {
+                format!("active profile '{name}' not found for tool '{tool_name}'")
+            })?,
+            None => Profile::default(),
+        };
     let rewrites = Rewrites::from_profile(&profile).with_context(|| {
         format!(
             "profile '{}' for tool '{tool_name}' has an invalid header",
@@ -90,6 +117,38 @@ fn resolve_rewrites(cfg: &Config, st: &State, tool_name: &str) -> Result<(Option
         )
     })?;
     Ok((active, rewrites))
+}
+
+/// Validate a selected subscription profile and build the immutable inputs for one run.
+fn prepare_subscription_run(
+    spec: &tool_specs::ToolSpec,
+    tool: &crate::config::Tool,
+    profile_name: &str,
+    requested_preset: Option<&str>,
+    trailing_args: &[String],
+) -> Result<PreparedSubscriptionRun> {
+    let profile = tool.profiles.get(profile_name).cloned().with_context(|| {
+        format!(
+            "profile '{profile_name}' disappeared for tool '{}'",
+            spec.name
+        )
+    })?;
+    tool_specs::validate_runtime_profile(spec, profile_name, &profile)?;
+    let rewrites = Rewrites::from_profile(&profile).with_context(|| {
+        format!(
+            "profile '{}/{}' has an invalid header",
+            spec.name, profile_name
+        )
+    })?;
+    let (preset_name, preset_args) = selection::resolve_preset(spec.name, tool, requested_preset)?;
+    let mut child_args = preset_args;
+    child_args.extend_from_slice(trailing_args);
+    Ok(PreparedSubscriptionRun {
+        profile_name: profile_name.to_string(),
+        rewrites,
+        preset_name,
+        child_args,
+    })
 }
 
 /// Launch the tool with interception. Returns the child's exit code.
@@ -112,6 +171,154 @@ pub async fn run_tool(
     let st = State::load(&paths.state_file())?;
     let (active, rewrites) = resolve_rewrites(&cfg, &st, tool_name)?;
 
+    let outcome = execute_tool(
+        paths,
+        &cfg,
+        tool_name,
+        tool.clone(),
+        tool.hosts.clone(),
+        active,
+        None,
+        rewrites,
+        extra_args.to_vec(),
+        show_secrets,
+        capture_output,
+    )
+    .await?;
+    Ok(outcome.exit_code)
+}
+
+/// Launch a first-class subscription tool, selecting a profile for this run and recording usage.
+pub async fn run_subscription_tool(
+    paths: &Paths,
+    tool_name: &str,
+    forced_profile: Option<&str>,
+    requested_preset: Option<&str>,
+    trailing_args: &[String],
+    show_secrets: bool,
+    capture_output: bool,
+) -> Result<i32> {
+    let spec = tool_specs::get(tool_name)?;
+    let cfg_path = paths.config_file();
+    if !cfg_path.exists() {
+        bail!("no config at {} — run `rtr init` first", cfg_path.display());
+    }
+    let cfg = Config::load(&cfg_path)?;
+    let tool = cfg.tool(spec.name)?.clone();
+    if tool.command.is_empty() {
+        bail!("tool '{}' has an empty command", spec.name);
+    }
+
+    let state_path = paths.state_file();
+    let prepared = if let Some(profile_name) = forced_profile {
+        prepare_subscription_run(spec, &tool, profile_name, requested_preset, trailing_args)?
+    } else {
+        State::update_locked(&state_path, |state| {
+            let profile_name = selection::select_profile(spec.name, &tool, state, None)?;
+            prepare_subscription_run(spec, &tool, &profile_name, requested_preset, trailing_args)
+        })?
+    };
+
+    let result = execute_tool(
+        paths,
+        &cfg,
+        spec.name,
+        tool.clone(),
+        tool_specs::runtime_hosts(spec),
+        Some(prepared.profile_name.clone()),
+        prepared.preset_name.clone(),
+        prepared.rewrites,
+        prepared.child_args,
+        show_secrets,
+        capture_output,
+    )
+    .await;
+
+    let exit_code = result.as_ref().ok().map(|outcome| outcome.exit_code);
+    usage::append_event(
+        &paths.usage_file(),
+        &usage::new_event(
+            spec.name,
+            &prepared.profile_name,
+            prepared.preset_name.as_deref(),
+            exit_code,
+        ),
+    )?;
+    result.map(|outcome| outcome.exit_code)
+}
+
+/// Launch a subscription tool with capture hosts and no rewrites, then print the import command.
+pub async fn capture_subscription_tool(
+    paths: &Paths,
+    tool_name: &str,
+    profile_name: &str,
+) -> Result<i32> {
+    let spec = tool_specs::get(tool_name)?;
+    let cfg_path = paths.config_file();
+    if !cfg_path.exists() {
+        bail!("no config at {} — run `rtr init` first", cfg_path.display());
+    }
+    let cfg = Config::load(&cfg_path)?;
+    let tool = cfg.tool(spec.name)?.clone();
+    if tool.command.is_empty() {
+        bail!("tool '{}' has an empty command", spec.name);
+    }
+
+    print_capture_instructions(spec.name, profile_name);
+    let outcome = execute_tool(
+        paths,
+        &cfg,
+        spec.name,
+        tool,
+        tool_specs::capture_hosts(spec),
+        Some(format!("{profile_name} (capture only; no rewrites)")),
+        None,
+        Rewrites::default(),
+        Vec::new(),
+        false,
+        false,
+    )
+    .await?;
+    println!();
+    println!("Capture written to:");
+    println!("  {}", outcome.capture_path.display());
+    println!();
+    println!("After exit, run:");
+    println!(
+        "  rtr import {} --profile {} --from-capture {}",
+        spec.name,
+        shell_quote(profile_name),
+        shell_quote(&outcome.capture_path.display().to_string())
+    );
+    Ok(outcome.exit_code)
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'@'))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+async fn execute_tool(
+    paths: &Paths,
+    cfg: &Config,
+    tool_name: &str,
+    tool: crate::config::Tool,
+    hosts: Vec<String>,
+    profile: Option<String>,
+    preset: Option<String>,
+    rewrites: Rewrites,
+    child_args: Vec<String>,
+    show_secrets: bool,
+    capture_output: bool,
+) -> Result<RunOutcome> {
     let ca = ca::load_or_generate(&paths.ca_cert(), &paths.ca_key())?;
     let authority = ca.authority()?;
 
@@ -136,19 +343,16 @@ pub async fn run_tool(
     crate::init_file_tracing(&log_path);
     let capture_path = run_dir.join("capture.jsonl");
     let sink = CaptureSink::to_file(&capture_path)?;
-    let handler = RewriteHandler::new(
-        tool.hosts.clone(),
-        rewrites,
-        sink,
-        show_secrets,
-        capture_output,
-    );
+    let handler = RewriteHandler::new(hosts.clone(), rewrites, sink, show_secrets, capture_output);
 
     eprintln!(
         "rtr: proxy on 127.0.0.1:{port} intercepting {}",
-        hosts_label(&tool.hosts)
+        hosts_label(&hosts)
     );
-    eprintln!("rtr: profile = {}", active.as_deref().unwrap_or("(none)"));
+    eprintln!("rtr: profile = {}", profile.as_deref().unwrap_or("(none)"));
+    if let Some(preset) = &preset {
+        eprintln!("rtr: preset  = {preset}");
+    }
     eprintln!("rtr: captures -> {}", capture_path.display());
     eprintln!("rtr: logs     -> {}", log_path.display());
 
@@ -158,7 +362,7 @@ pub async fn run_tool(
     }));
 
     let mut command = Command::new(&tool.command[0]);
-    command.args(&tool.command[1..]).args(extra_args);
+    command.args(&tool.command[1..]).args(&child_args);
     for (k, v) in proxy_env(port, &ca.cert_path) {
         command.env(k, v);
     }
@@ -182,7 +386,24 @@ pub async fn run_tool(
         Ok(Err(e)) => tracing::warn!("proxy stopped with error: {e:#}"),
         Err(e) => tracing::warn!("proxy task did not join cleanly: {e}"),
     }
-    Ok(code)
+    Ok(RunOutcome {
+        exit_code: code,
+        capture_path,
+        log_path,
+        profile,
+        preset,
+    })
+}
+
+fn print_capture_instructions(tool: &str, profile: &str) {
+    println!("rtr capture {tool}/{profile}");
+    println!();
+    println!("I will launch {tool} with no rewrites.");
+    println!("In {tool}:");
+    println!("  1. log out");
+    println!("  2. log in to the target subscription");
+    println!("  3. send: hello");
+    println!("  4. exit");
 }
 
 /// Spawn the child with piped stdio, tee'ing both streams to the terminal and a
@@ -325,8 +546,9 @@ mod tests {
 
     #[test]
     fn proxy_env_sets_proxy_and_ca_vars() {
-        let env: HashMap<String, String> =
-            proxy_env(62888, Path::new("/c/ca.pem")).into_iter().collect();
+        let env: HashMap<String, String> = proxy_env(62888, Path::new("/c/ca.pem"))
+            .into_iter()
+            .collect();
         assert_eq!(env["HTTPS_PROXY"], "http://127.0.0.1:62888");
         assert_eq!(env["https_proxy"], "http://127.0.0.1:62888");
         assert_eq!(env["ALL_PROXY"], "http://127.0.0.1:62888");
@@ -335,6 +557,14 @@ mod tests {
         assert_eq!(env["NODE_EXTRA_CA_CERTS"], "/c/ca.pem");
         assert_eq!(env["CURL_CA_BUNDLE"], "/c/ca.pem");
         assert_eq!(env["GIT_SSL_CAINFO"], "/c/ca.pem");
+    }
+
+    #[test]
+    fn shell_quote_handles_spaces_and_quotes() {
+        assert_eq!(shell_quote("plain/path"), "plain/path");
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote("can't"), "'can'\\''t'");
+        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]
@@ -353,7 +583,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("output.log");
         let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("echo hello-from-child; echo errline 1>&2; exit 7");
+        cmd.arg("-c")
+            .arg("echo hello-from-child; echo errline 1>&2; exit 7");
         let code = run_with_tee(&mut cmd, &out).await.unwrap();
         assert_eq!(code, 7);
         let log = std::fs::read_to_string(&out).unwrap();
@@ -384,11 +615,12 @@ mod tests {
         assert!(out.contains("127.0.0.1:62888"), "{out}");
         assert!(out.contains("AA:BB"), "{out}");
         assert!(out.contains("NOT trusted"), "{out}");
-        assert!(out.contains("codex  (active: codex-1)"), "{out}");
-        assert!(out.contains("api.openai.com"), "{out}");
-        assert!(out.contains("codex-2"), "{out}");
+        assert!(out.contains("claude  (active: (none))"), "{out}");
+        assert!(out.contains(".anthropic.com"), "{out}");
+        assert!(out.contains("codex  (active: (none))"), "{out}");
+        assert!(out.contains("chatgpt.com"), "{out}");
+        assert!(out.contains("profiles:"), "{out}");
 
-        // Unknown filter errors; valid filter narrows.
         assert!(render_status(&cfg, &st, "/c/ca.pem", "AA", true, Some("ghost")).is_err());
         let only = render_status(&cfg, &st, "/c/ca.pem", "AA", true, Some("codex")).unwrap();
         assert!(only.contains("trusted"), "{only}");
