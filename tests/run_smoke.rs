@@ -10,6 +10,24 @@ use rtr::{
     config::{self, Config},
     import::{self, ConflictPolicy},
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+async fn read_http_head(stream: &mut TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut tmp).await.unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
 
 #[tokio::test]
 async fn run_tool_tees_output_and_propagates_exit() {
@@ -65,6 +83,58 @@ hosts = []
 }
 
 #[tokio::test]
+async fn run_tool_applies_legacy_active_profile_rewrites() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    tokio::spawn(async move {
+        let (mut sock, _) = upstream.accept().await.unwrap();
+        let head = read_http_head(&mut sock).await;
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await;
+        let _ = sock.flush().await;
+        let _ = tx.send(head);
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        config_dir: tmp.path().join("config"),
+        state_dir: tmp.path().join("state"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+
+    let cfg = format!(
+        r#"
+[proxy]
+port = 0
+
+[tools.legacy]
+command = ["curl", "--silent", "--show-error", "http://127.0.0.1:{up_port}/legacy"]
+hosts = ["127.0.0.1"]
+active = "personal"
+
+[tools.legacy.profiles.personal]
+set = {{ Authorization = "Bearer legacy" }}
+"#
+    );
+    std::fs::write(paths.config_file(), cfg).unwrap();
+
+    let code = runner::run_tool(&paths, "legacy", &[], false, false)
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    let head = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+        .await
+        .expect("upstream did not receive a request")
+        .unwrap();
+    assert!(
+        head.to_lowercase().contains("authorization: bearer legacy"),
+        "upstream head: {head}"
+    );
+}
+
+#[tokio::test]
 async fn subscription_run_uses_profile_preset_args_and_records_usage() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths {
@@ -78,7 +148,7 @@ async fn subscription_run_uses_profile_preset_args_and_records_usage() {
 port = 0
 
 [tools.codex]
-command = ["sh", "-c", "printf '%s\\n' \"$@\"; exit 6", "runner", "base"]
+command = ["sh", "-c", "printf 'home=%s\\n' \"$CODEX_HOME\"; printf '%s\\n' \"$@\"; exit 6", "runner", "base"]
 hosts = []
 default_preset = "p"
 
@@ -86,7 +156,7 @@ default_preset = "p"
 args = ["preset"]
 
 [tools.codex.profiles.personal]
-set = { Authorization = "Bearer token", chatgpt-account-id = "acct" }
+set = {}
 "#;
     std::fs::write(paths.config_file(), cfg).unwrap();
 
@@ -110,7 +180,14 @@ set = { Authorization = "Bearer token", chatgpt-account-id = "acct" }
         .unwrap()
         .path();
     let out = std::fs::read_to_string(run_dir.join("output.log")).unwrap();
-    assert_eq!(out, "base\npreset\nextra\n");
+    assert_eq!(
+        out,
+        format!(
+            "home={}\nbase\npreset\nextra\n",
+            paths.profile_home_dir("codex", "personal").display()
+        )
+    );
+    assert!(paths.profile_home_dir("codex", "personal").is_dir());
 
     let events = usage::read_events(&paths.usage_file()).unwrap();
     assert_eq!(events.len(), 1);
@@ -121,7 +198,52 @@ set = { Authorization = "Bearer token", chatgpt-account-id = "acct" }
 }
 
 #[tokio::test]
-async fn subscription_run_rejects_profile_missing_required_rewrites() {
+async fn subscription_run_sets_claude_config_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        config_dir: tmp.path().join("config"),
+        state_dir: tmp.path().join("state"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+
+    let cfg = r#"
+[proxy]
+port = 0
+
+[tools.claude]
+command = ["sh", "-c", "printf 'home=%s\\n' \"$CLAUDE_CONFIG_DIR\""]
+hosts = []
+
+[tools.claude.profiles.work]
+set = {}
+"#;
+    std::fs::write(paths.config_file(), cfg).unwrap();
+
+    let code =
+        runner::run_subscription_tool(&paths, "claude", Some("work"), None, &[], false, true)
+            .await
+            .unwrap();
+    assert_eq!(code, 0);
+
+    let run_dir = std::fs::read_dir(paths.runs_dir().join("claude"))
+        .expect("run dir created")
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let out = std::fs::read_to_string(run_dir.join("output.log")).unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "home={}\n",
+            paths.profile_home_dir("claude", "work").display()
+        )
+    );
+    assert!(paths.profile_home_dir("claude", "work").is_dir());
+}
+
+#[tokio::test]
+async fn subscription_run_ignores_stored_rewrites_for_native_home_profiles() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths {
         config_dir: tmp.path().join("config"),
@@ -137,19 +259,49 @@ port = 0
 command = ["sh", "-c", "exit 0"]
 hosts = []
 
-[tools.codex.profiles.incomplete]
-set = { Authorization = "Bearer token" }
+[tools.codex.profiles.personal]
+set = { "bad header" = "would fail if parsed", Authorization = "Bearer stale" }
+"#;
+    std::fs::write(paths.config_file(), cfg).unwrap();
+
+    let code =
+        runner::run_subscription_tool(&paths, "codex", Some("personal"), None, &[], false, false)
+            .await
+            .unwrap();
+    assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn subscription_run_rejects_forced_disabled_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        config_dir: tmp.path().join("config"),
+        state_dir: tmp.path().join("state"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+
+    let cfg = r#"
+[proxy]
+port = 0
+
+[tools.codex]
+command = ["sh", "-c", "exit 0"]
+hosts = []
+
+[tools.codex.profiles.personal]
+enabled = false
+set = {}
 "#;
     std::fs::write(paths.config_file(), cfg).unwrap();
 
     let err =
-        runner::run_subscription_tool(&paths, "codex", Some("incomplete"), None, &[], false, false)
+        runner::run_subscription_tool(&paths, "codex", Some("personal"), None, &[], false, false)
             .await
             .unwrap_err()
             .to_string();
-    assert!(err.contains("codex/incomplete"), "got: {err}");
-    assert!(err.contains("chatgpt-account-id"), "got: {err}");
-    assert!(!paths.runs_dir().join("codex").exists());
+    assert!(err.contains("codex/personal"), "got: {err}");
+    assert!(err.contains("disabled"), "got: {err}");
+    assert!(!paths.profile_home_dir("codex", "personal").exists());
 }
 
 #[tokio::test]
@@ -168,12 +320,13 @@ port = 0
 [tools.codex]
 command = ["sh", "-c", "exit 0"]
 hosts = []
+default_preset = "missing"
 
 [tools.codex.profiles.bad]
-set = { Authorization = "Bearer token" }
+set = {}
 
 [tools.codex.profiles.next]
-set = { Authorization = "Bearer token", chatgpt-account-id = "acct" }
+set = {}
 "#;
     std::fs::write(paths.config_file(), cfg).unwrap();
 
@@ -181,7 +334,7 @@ set = { Authorization = "Bearer token", chatgpt-account-id = "acct" }
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("codex/bad"), "got: {err}");
+    assert!(err.contains("no preset"), "got: {err}");
 
     let state = State::load(&paths.state_file()).unwrap();
     assert_eq!(state.round_robin_cursor("codex"), 0);
@@ -206,7 +359,7 @@ command = ["sh", "-c", "curl --silent --show-error --max-time 1 http://127.0.0.1
 hosts = ["*"]
 
 [tools.codex.profiles.personal]
-set = { Authorization = "Bearer token", chatgpt-account-id = "acct" }
+set = { Authorization = "Bearer stale", chatgpt-account-id = "stale" }
 "#;
     std::fs::write(paths.config_file(), cfg).unwrap();
 
@@ -230,6 +383,45 @@ set = { Authorization = "Bearer token", chatgpt-account-id = "acct" }
 }
 
 #[tokio::test]
+async fn capture_subscription_run_sets_native_home_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths {
+        config_dir: tmp.path().join("config"),
+        state_dir: tmp.path().join("state"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+    let marker = paths.state_dir.join("capture-home.txt");
+
+    let cfg = format!(
+        r#"
+[proxy]
+port = 0
+
+[tools.codex]
+command = ["sh", "-c", "printf '%s' \"$CODEX_HOME\" > {}"]
+hosts = []
+"#,
+        marker.display()
+    );
+    std::fs::write(paths.config_file(), cfg).unwrap();
+
+    let code = runner::capture_subscription_tool(&paths, "codex", "personal")
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    let captured_home = std::fs::read_to_string(marker).unwrap();
+    assert_eq!(
+        captured_home,
+        paths
+            .profile_home_dir("codex", "personal")
+            .display()
+            .to_string()
+    );
+    assert!(paths.profile_home_dir("codex", "personal").is_dir());
+}
+
+#[tokio::test]
 async fn starter_imported_profile_runs_unforced() {
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths {
@@ -248,7 +440,7 @@ async fn starter_imported_profile_runs_unforced() {
     let capture_path = paths.state_dir.join("capture.jsonl");
     std::fs::write(
         &capture_path,
-        r#"{"ts":"2026-07-01T12:00:00Z","method":"GET","url":"https://chatgpt.com/backend-api/codex/models","host":"chatgpt.com","headers":[["authorization","Bearer token"],["chatgpt-account-id","acct"]]}"#,
+        r#"{"ts":"2026-07-01T12:00:00Z","method":"GET","url":"https://chatgpt.com/backend-api/codex/models","host":"chatgpt.com","headers":[["accept","*/*"]]}"#,
     )
     .unwrap();
     import::run_import_profile(
@@ -265,6 +457,16 @@ async fn starter_imported_profile_runs_unforced() {
         .await
         .unwrap();
     assert_eq!(code, 0);
+
+    let cfg = Config::load(&paths.config_file()).unwrap();
+    assert!(cfg
+        .tool("codex")
+        .unwrap()
+        .profiles
+        .get("personal")
+        .unwrap()
+        .set
+        .is_empty());
 
     let events = usage::read_events(&paths.usage_file()).unwrap();
     assert_eq!(events.len(), 1);

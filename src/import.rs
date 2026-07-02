@@ -14,6 +14,7 @@ pub struct AuthBundle {
     pub rewrites: BTreeMap<String, String>,
     pub metadata: BTreeMap<String, String>,
     pub hosts: BTreeSet<String>,
+    pub discarded_legacy_rewrites: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,26 +74,29 @@ fn extract_auth_bundle_from_records(
         }
     }
 
-    let mut rewrites = BTreeMap::new();
+    let mut candidate_rewrites = BTreeMap::new();
+    let mut ambiguous_legacy_rewrites = false;
     for required in spec.required_headers {
         let Some(found) = values.get(required) else {
-            bail!(
-                "capture is missing required {required} header for {}",
-                spec.name
-            );
+            continue;
         };
         if found.len() > 1 {
-            bail!(
-                "capture has conflicting {required} values for {} ({} distinct values)",
-                spec.name,
-                found.len()
-            );
+            ambiguous_legacy_rewrites = true;
+            continue;
         }
-        rewrites.insert(
+        candidate_rewrites.insert(
             (*required).to_string(),
             found.iter().next().unwrap().clone(),
         );
     }
+    let incomplete_legacy_rewrites =
+        !candidate_rewrites.is_empty() && candidate_rewrites.len() < spec.required_headers.len();
+    let discarded_legacy_rewrites = ambiguous_legacy_rewrites || incomplete_legacy_rewrites;
+    let rewrites = if discarded_legacy_rewrites {
+        BTreeMap::new()
+    } else {
+        candidate_rewrites
+    };
 
     let metadata = metadata
         .into_iter()
@@ -110,6 +114,7 @@ fn extract_auth_bundle_from_records(
         rewrites,
         metadata,
         hosts,
+        discarded_legacy_rewrites,
     })
 }
 
@@ -138,9 +143,20 @@ pub fn render_auth_bundle(spec: &ToolSpec, bundle: &AuthBundle, show_secrets: bo
 
     let mut out = String::new();
     let _ = writeln!(out, "Detected {} auth bundle:", display_tool(spec.name));
-    for name in spec.required_headers {
-        if let Some(value) = bundle.rewrites.get(*name) {
-            let _ = writeln!(out, "  {name}: {}", bundle_value(value, show_secrets));
+    if bundle.rewrites.is_empty() {
+        if bundle.discarded_legacy_rewrites {
+            let _ = writeln!(
+                out,
+                "  Legacy rewrites: (incomplete or ambiguous bundle captured; not saved)"
+            );
+        } else {
+            let _ = writeln!(out, "  Legacy rewrites: (none captured)");
+        }
+    } else {
+        for name in spec.required_headers {
+            if let Some(value) = bundle.rewrites.get(*name) {
+                let _ = writeln!(out, "  {name}: {}", bundle_value(value, show_secrets));
+            }
         }
     }
     if !bundle.hosts.is_empty() {
@@ -252,6 +268,14 @@ pub fn save_imported_profile<F>(
 where
     F: FnOnce(&str, &str) -> Result<bool>,
 {
+    if bundle.hosts.is_empty() {
+        bail!(
+            "capture has no {} traffic; refusing to save profile '{}'",
+            spec.name,
+            profile_name
+        );
+    }
+
     let tool = cfg
         .tools
         .entry(spec.name.to_string())
@@ -489,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn import_errors_on_missing_or_conflicting_required_fields() {
+    fn import_allows_missing_rewrites_and_errors_on_conflicts() {
         let codex = tool_specs::get("codex").unwrap();
         let missing = extract_auth_bundle_from_records(
             codex,
@@ -498,9 +522,16 @@ mod tests {
                 &[("authorization", "Bearer codex-token")],
             )],
         )
-        .unwrap_err()
-        .to_string();
-        assert!(missing.contains("chatgpt-account-id"), "got: {missing}");
+        .unwrap();
+        assert!(missing.rewrites.is_empty());
+        assert!(missing.discarded_legacy_rewrites);
+        assert!(!missing.rewrites.contains_key("chatgpt-account-id"));
+
+        let empty =
+            extract_auth_bundle_from_records(codex, &[rec("chatgpt.com", &[("accept", "*/*")])])
+                .unwrap();
+        assert!(empty.rewrites.is_empty());
+        assert!(!empty.discarded_legacy_rewrites);
 
         let conflicting = extract_auth_bundle_from_records(
             codex,
@@ -521,12 +552,9 @@ mod tests {
                 ),
             ],
         )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            conflicting.contains("conflicting Authorization"),
-            "got: {conflicting}"
-        );
+        .unwrap();
+        assert!(conflicting.rewrites.is_empty());
+        assert!(conflicting.discarded_legacy_rewrites);
     }
 
     #[test]
@@ -552,6 +580,7 @@ mod tests {
             .collect(),
             metadata: BTreeMap::new(),
             hosts: ["chatgpt.com".to_string()].into_iter().collect(),
+            discarded_legacy_rewrites: false,
         };
         let hidden = render_auth_bundle(spec, &bundle, false);
         assert!(!hidden.contains("raw-token"), "{hidden}");
@@ -572,7 +601,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             metadata: BTreeMap::new(),
-            hosts: BTreeSet::new(),
+            hosts: ["chatgpt.com".to_string()].into_iter().collect(),
+            discarded_legacy_rewrites: false,
         };
         let first = save_imported_profile(
             &mut cfg,
@@ -630,7 +660,8 @@ set = { Authorization = "Bearer old" }
                 .into_iter()
                 .collect(),
             metadata: BTreeMap::new(),
-            hosts: BTreeSet::new(),
+            hosts: ["api.anthropic.com".to_string()].into_iter().collect(),
+            discarded_legacy_rewrites: false,
         };
         let skipped = save_imported_profile(
             &mut cfg,
@@ -680,6 +711,29 @@ set = { Authorization = "Bearer old" }
             .to_string();
         assert!(err.contains("non-interactive"), "got: {err}");
         assert!(err.contains("--force"), "got: {err}");
+    }
+
+    #[test]
+    fn save_import_rejects_capture_without_matching_hosts() {
+        let spec = tool_specs::get("codex").unwrap();
+        let mut cfg = Config::parse("[tools.codex]\ncommand=[\"codex\"]\n").unwrap();
+        let bundle = AuthBundle {
+            rewrites: BTreeMap::new(),
+            metadata: BTreeMap::new(),
+            hosts: BTreeSet::new(),
+            discarded_legacy_rewrites: false,
+        };
+        let err = save_imported_profile(
+            &mut cfg,
+            spec,
+            "personal",
+            &bundle,
+            ConflictPolicy::Reject,
+            |_, _| Ok(false),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no codex traffic"), "got: {err}");
     }
 
     #[test]
