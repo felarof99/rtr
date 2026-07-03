@@ -49,6 +49,7 @@ mod tests {
             hosts: vec![],
             active: None,
             selection: Some("round-robin".to_string()),
+            skills_source: None,
             profiles: names
                 .iter()
                 .map(|name| ((*name).to_string(), Profile::default()))

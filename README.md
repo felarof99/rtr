@@ -18,6 +18,8 @@ networking.
   routing table, kernel extension, or system-wide interception
 - **Native profile homes** — first-class `rtr claude` / `rtr codex` set
   `CLAUDE_CONFIG_DIR` / `CODEX_HOME` under `~/.local/state/rtr/homes/...`
+- **Fresh skills sync** — each first-class run replaces `<profile home>/skills`
+  from the tool default or configured source
 - **Simple onboarding** — create a profile, log in inside that native home, and
   the profile is ready
 - **Capture for inspection** — every run records matching traffic to
@@ -71,6 +73,7 @@ the proxy env only for that process. First-class profile identity comes from:
 ```text
 CODEX_HOME=<state>/homes/codex/<profile>
 CLAUDE_CONFIG_DIR=<state>/homes/claude/<profile>
+<native home>/skills refreshed before launch
 ```
 
 Those dirs are created owner-only and are separate from global `~/.codex` or the
@@ -184,6 +187,7 @@ port = 62888
 command = ["codex"]
 hosts = ["chatgpt.com"]
 selection = "round-robin"
+skills_source = "~/.skills"
 
 [tools.codex.profiles.personal]
 enabled = true
@@ -192,6 +196,7 @@ enabled = true
 command = ["claude"]
 hosts = [".anthropic.com"]
 selection = "round-robin"
+skills_source = "~/.skills"
 
 [tools.claude.profiles.work]
 enabled = true
@@ -204,6 +209,7 @@ x-organization-uuid = "captured-for-display-only"
 | `command` | Program and base args to spawn; user args are appended |
 | `hosts` | Exact hostnames or dot-prefixed suffixes for legacy/custom `rtr run` interception |
 | `selection` | `round-robin` for first-class subscription commands |
+| `skills_source` | Optional directory copied fresh to `<profile home>/skills` before first-class runs |
 | `enabled` | Optional profile flag; absent means enabled |
 | `set` | Legacy/custom `rtr run` headers to add or overwrite before forwarding upstream |
 | `remove` | Headers to delete before forwarding upstream |
@@ -232,7 +238,11 @@ Subscription run usage is appended to `~/.local/state/rtr/usage.jsonl` so
 First-class profile homes live under
 `~/.local/state/rtr/homes/<tool>/<profile>/`. `rtr codex` sets `CODEX_HOME` to
 that directory; `rtr claude` sets `CLAUDE_CONFIG_DIR`. First-class runs do not
-mutate global `~/.codex` or shared Claude config.
+mutate global `~/.codex` or shared Claude config. Before launching, they replace
+`<profile home>/skills` from `skills_source` when configured, otherwise from
+`~/.codex/skills` or `~/.claude/skills`. Explicit sources must exist; missing
+defaults simply leave no synced skills. Relative `skills_source` paths resolve
+from the rtr config directory.
 
 Interception is **host-scoped**. First-class `rtr claude` / `rtr codex` runs use
 the built-in runtime hosts (`.anthropic.com` and exact `chatgpt.com`) for scoped

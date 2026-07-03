@@ -270,6 +270,7 @@ where
             hosts: tool_specs::runtime_hosts(spec),
             active: None,
             selection: Some("round-robin".to_string()),
+            skills_source: None,
             profiles: BTreeMap::new(),
         });
 

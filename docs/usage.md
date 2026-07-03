@@ -79,7 +79,9 @@ rtr codex --profile personal
 `rtr codex` creates/uses `~/.local/state/rtr/homes/codex/<profile>/` and sets
 `CODEX_HOME` for the child. `rtr claude` creates/uses
 `~/.local/state/rtr/homes/claude/<profile>/` and sets `CLAUDE_CONFIG_DIR`.
-Global `~/.codex` and shared Claude config are not mutated by first-class runs.
+Before spawning, rtr replaces `<profile home>/skills` from the tool default or
+configured source. Global `~/.codex` and shared Claude config are not mutated by
+first-class runs.
 
 Every selected run is recorded, successful or failed. `rtr stats --today` shows
 per-profile run counts and failed-run percentages.
@@ -178,6 +180,7 @@ hosts   = ["chatgpt.com"]    # legacy/custom rtr run intercept scope
 # the blast radius small and are the recommended default.
 # First-class rtr claude/codex runs use built-in runtime hosts instead.
 selection = "round-robin"    # first-class claude/codex runtime selection
+skills_source = "~/.skills"  # optional: copied fresh to <profile home>/skills
 
 [tools.<name>.profiles.<profile>]
 enabled = true                                               # default if omitted
@@ -189,6 +192,13 @@ x-organization-uuid = "stored for display, not rewritten"
 
 The file is created `0600` because it holds tokens. Round-robin cursors and
 legacy `rtr switch` state live in `~/.local/state/rtr/state.toml`.
+
+First-class `rtr claude` and `rtr codex` runs refresh
+`<profile home>/skills` before launching. If `skills_source` is configured, that
+directory must exist and is copied after deleting the old destination. If it is
+omitted, rtr defaults to `~/.claude/skills` or `~/.codex/skills`; a missing
+default removes any stale destination and continues with no synced skills.
+Relative `skills_source` paths resolve from the rtr config directory.
 
 ## Environment variables
 
@@ -227,8 +237,8 @@ re-frame compressed messages — uncompressed WS works transparently.
   legacy bundles are discarded.
 - **A profile starts without my usual Codex/Claude preferences** — first-class
   profile homes start isolated so rtr does not copy global auth credentials by
-  accident. Shared files outside the tool home, such as a home-level `.skills`
-  directory, remain visible through the normal `HOME`.
+  accident. Put shared skill definitions in `skills_source = "~/.skills"` if you
+  want each selected profile home to receive a fresh copy on launch.
 - **TUI looks wrong with `--log`** — `--log` pipes stdout; drop it (default
   inherits the terminal). Captures don't need `--log`.
 - **Regenerating the CA** — run `rtr untrust` *before* deleting the CA files and
