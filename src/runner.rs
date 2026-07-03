@@ -85,12 +85,10 @@ pub struct RunOutcome {
     pub capture_path: std::path::PathBuf,
     pub log_path: std::path::PathBuf,
     pub profile: Option<String>,
-    pub preset: Option<String>,
 }
 
 struct PreparedSubscriptionRun {
     profile_name: String,
-    preset_name: Option<String>,
     child_args: Vec<String>,
     child_env: Vec<(String, std::ffi::OsString)>,
     rewrites: Rewrites,
@@ -126,8 +124,7 @@ fn prepare_subscription_run(
     spec: &tool_specs::ToolSpec,
     tool: &crate::config::Tool,
     profile_name: &str,
-    requested_preset: Option<&str>,
-    trailing_args: &[String],
+    runtime_args: &[String],
 ) -> Result<PreparedSubscriptionRun> {
     let profile = tool.profiles.get(profile_name).with_context(|| {
         format!(
@@ -138,14 +135,10 @@ fn prepare_subscription_run(
     if !profile.enabled {
         bail!("profile '{}/{}' is disabled", spec.name, profile_name);
     }
-    let (preset_name, preset_args) = selection::resolve_preset(spec.name, tool, requested_preset)?;
-    let mut child_args = preset_args;
-    child_args.extend_from_slice(trailing_args);
     let child_env = native_profile_env(paths, spec, profile_name)?;
     Ok(PreparedSubscriptionRun {
         profile_name: profile_name.to_string(),
-        preset_name,
-        child_args,
+        child_args: runtime_args.to_vec(),
         child_env,
         // Native homes are the first-class identity boundary; captured header
         // rewrites remain legacy/custom `rtr run` behavior.
@@ -193,7 +186,6 @@ pub async fn run_tool(
         tool.clone(),
         tool.hosts.clone(),
         active,
-        None,
         rewrites,
         extra_args.to_vec(),
         Vec::new(),
@@ -209,8 +201,7 @@ pub async fn run_subscription_tool(
     paths: &Paths,
     tool_name: &str,
     forced_profile: Option<&str>,
-    requested_preset: Option<&str>,
-    trailing_args: &[String],
+    runtime_args: &[String],
     show_secrets: bool,
     capture_output: bool,
 ) -> Result<i32> {
@@ -227,25 +218,11 @@ pub async fn run_subscription_tool(
 
     let state_path = paths.state_file();
     let prepared = if let Some(profile_name) = forced_profile {
-        prepare_subscription_run(
-            paths,
-            spec,
-            &tool,
-            profile_name,
-            requested_preset,
-            trailing_args,
-        )?
+        prepare_subscription_run(paths, spec, &tool, profile_name, runtime_args)?
     } else {
         State::update_locked(&state_path, |state| {
             let profile_name = selection::select_profile(spec.name, &tool, state, None)?;
-            prepare_subscription_run(
-                paths,
-                spec,
-                &tool,
-                &profile_name,
-                requested_preset,
-                trailing_args,
-            )
+            prepare_subscription_run(paths, spec, &tool, &profile_name, runtime_args)
         })?
     };
 
@@ -256,7 +233,6 @@ pub async fn run_subscription_tool(
         tool.clone(),
         tool_specs::runtime_hosts(spec),
         Some(prepared.profile_name.clone()),
-        prepared.preset_name.clone(),
         prepared.rewrites,
         prepared.child_args,
         prepared.child_env,
@@ -268,12 +244,7 @@ pub async fn run_subscription_tool(
     let exit_code = result.as_ref().ok().map(|outcome| outcome.exit_code);
     usage::append_event(
         &paths.usage_file(),
-        &usage::new_event(
-            spec.name,
-            &prepared.profile_name,
-            prepared.preset_name.as_deref(),
-            exit_code,
-        ),
+        &usage::new_event(spec.name, &prepared.profile_name, exit_code),
     )?;
     result.map(|outcome| outcome.exit_code)
 }
@@ -309,7 +280,6 @@ pub async fn capture_subscription_tool(
         tool,
         tool_specs::capture_hosts(spec),
         Some(format!("{profile_name} (capture only; no rewrites)")),
-        None,
         Rewrites::default(),
         Vec::new(),
         child_env,
@@ -355,7 +325,6 @@ async fn execute_tool(
     tool: crate::config::Tool,
     hosts: Vec<String>,
     profile: Option<String>,
-    preset: Option<String>,
     rewrites: Rewrites,
     child_args: Vec<String>,
     child_env: Vec<(String, std::ffi::OsString)>,
@@ -393,9 +362,6 @@ async fn execute_tool(
         hosts_label(&hosts)
     );
     eprintln!("rtr: profile = {}", profile.as_deref().unwrap_or("(none)"));
-    if let Some(preset) = &preset {
-        eprintln!("rtr: preset  = {preset}");
-    }
     eprintln!("rtr: captures -> {}", capture_path.display());
     eprintln!("rtr: logs     -> {}", log_path.display());
 
@@ -437,7 +403,6 @@ async fn execute_tool(
         capture_path,
         log_path,
         profile,
-        preset,
     })
 }
 
@@ -658,8 +623,7 @@ set = { Authorization = "Bearer stale", chatgpt-account-id = "stale-account" }
         .unwrap()
         .clone();
         let spec = tool_specs::get("codex").unwrap();
-        let prepared =
-            prepare_subscription_run(&paths, spec, &tool, "personal", None, &[]).unwrap();
+        let prepared = prepare_subscription_run(&paths, spec, &tool, "personal", &[]).unwrap();
         assert!(prepared.rewrites.is_empty());
 
         let (sink, buf) = CaptureSink::in_memory();

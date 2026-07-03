@@ -118,31 +118,24 @@ Codex legacy import recognizes:
 - ignored: `Cookie`, `ab.chatgpt.com` telemetry, `statsig-api-key`
 - runtime host scope: exact `chatgpt.com`
 
-### 6. Presets and trailing args
-
-Tool presets live under the tool, not under profiles:
-
-```toml
-[tools.codex]
-command = ["codex"]
-default_preset = "gpt55-xhigh"
-
-[tools.codex.presets.gpt55-xhigh]
-args = ["-m", "gpt-5.5", "-c", "model_reasoning_effort=xhigh"]
-```
+### 6. Per-run tool args
 
 Runtime order is:
 
 ```text
-configured command + preset args + trailing CLI args
+configured command + per-run tool args
 ```
 
 Examples:
 
 ```sh
-rtr claude --preset opus-max -- extra args
-rtr codex --preset gpt55-xhigh -- extra args
+rtr claude --effort xhigh --model claude-fable-5 --dangerously-skip-permissions
+rtr codex --dangerously-bypass-approvals-and-sandbox -m gpt-5.5 -c model_reasoning_effort=xhigh
 ```
+
+Tool flags that rtr does not own can be passed directly. Put rtr-owned flags
+(`--profile/-p`, `--log`, `--show-secrets`) before tool args. If the tool itself
+needs one of those same flag names, put `--` before the tool args.
 
 ## Commands
 
@@ -151,9 +144,9 @@ rtr codex --preset gpt55-xhigh -- extra args
 | `rtr init [--force]` | Scaffold `config.toml` and mint the CA. |
 | `rtr capture <tool> --profile <name>` | Create/use a Claude/Codex profile, launch it with its native home, and capture traffic. |
 | `rtr import <tool> --profile <name> --from-capture <path>` | Legacy/custom: extract captured headers into rewrite settings. |
-| `rtr claude [--profile/-p <name>] [--preset <name>] [-- args]` | Run Claude with forced or round-robin profile selection. |
-| `rtr codex [--profile/-p <name>] [--preset <name>] [-- args]` | Run Codex with forced or round-robin profile selection. |
-| `rtr ls` | List configured Claude/Codex profiles and presets. |
+| `rtr claude [--profile/-p <name>] [tool args...]` | Run Claude with forced or round-robin profile selection. |
+| `rtr codex [--profile/-p <name>] [tool args...]` | Run Codex with forced or round-robin profile selection. |
+| `rtr ls` | List configured Claude/Codex profiles. |
 | `rtr show <tool>/<profile> [--show-secrets]` | Show one profile, redacted by default. |
 | `rtr stats [--today]` | Show per-profile run counts and failure percentages. |
 | `rtr <tool>` / `rtr run <tool> [-- args]` | Legacy generic run path for other configured tools. |
@@ -185,10 +178,6 @@ hosts   = ["chatgpt.com"]    # legacy/custom rtr run intercept scope
 # the blast radius small and are the recommended default.
 # First-class rtr claude/codex runs use built-in runtime hosts instead.
 selection = "round-robin"    # first-class claude/codex runtime selection
-default_preset = "xhigh"
-
-[tools.<name>.presets.xhigh]
-args = ["-m", "gpt-5.5"]
 
 [tools.<name>.profiles.<profile>]
 enabled = true                                               # default if omitted
