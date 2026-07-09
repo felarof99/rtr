@@ -59,6 +59,18 @@ the next cursor in `state.toml`. Forced selection validates the profile without
 changing that cursor. Each completed or failed launch appends a usage event, so
 `rtr stats --today` can report distribution and failure percentages.
 
+Claude Code stores user settings, app state, session history, and installed
+plugins under the selected config directory. Linux and Windows credential files
+also live there; macOS credential secrets remain in Keychain. Claude Code 2.1.205
+uses a distinct path-qualified Keychain service for each config directory, so
+profiles can keep separate logins even though the secret is stored outside the
+profile directory. rtr sets `CLAUDE_SECURESTORAGE_CONFIG_DIR` to the same path as
+`CLAUDE_CONFIG_DIR`, preventing an inherited secure-storage override from
+sharing one Keychain entry across profiles. rtr copies none of that shared state
+into a new profile. It seeds only personal skills, so commands, agents, plugins,
+settings, and sessions can differ by profile. Project `.claude/*` files still
+load normally from the working tree.
+
 Tool arguments are appended to the configured command:
 
 ```sh
@@ -116,6 +128,17 @@ intercepts every host reached by that child. First-class Claude/Codex commands
 use built-in runtime scopes instead of configured `hosts` and do not apply
 stored header rewrites.
 
+First-class `rtr claude` and `rtr codex` runs refresh
+`<profile home>/skills` before launching. If `skills_source` is configured, that
+directory must exist and is copied after deleting the old destination. If it is
+omitted, rtr defaults to `~/.claude/skills` or `~/.codex/skills`; a missing
+default removes any stale destination and continues with no synced skills.
+Relative `skills_source` paths resolve from the rtr config directory. Claude
+skill folders may be symlinks; links within the copied tree keep their relative
+form, while relative links outside it become absolute without resolving symlink
+aliases. Their `SKILL.md` remains readable from every profile home and later
+alias retargeting still takes effect. Codex symlink text is unchanged.
+
 The config file is `0600`. Round-robin cursors and legacy switch state live in
 `~/.local/state/rtr/state.toml`.
 
@@ -141,6 +164,8 @@ renders incorrectly.
   or set `[proxy] port = 0` for an ephemeral port.
 - **No eligible profiles** — run `rtr add <tool> --profile <name>`.
 - **A profile lacks preferences or skills** — native homes are isolated by
-  design; configure `skills_source` for shared skill definitions.
+  design; configure `skills_source` for shared skill definitions. For Claude,
+  keep profile-specific settings, commands, agents, and plugins inside that
+  profile's `CLAUDE_CONFIG_DIR`; project `.claude/*` files need no copying.
 - **Regenerating the CA** — run `rtr untrust` before deleting the CA files so an
   old trusted root does not remain in the keychain.

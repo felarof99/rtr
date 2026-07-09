@@ -15,8 +15,8 @@ state or changing system-wide networking.
 - **Native profile homes** — `rtr claude` and `rtr codex` set
   `CLAUDE_CONFIG_DIR` or `CODEX_HOME` under
   `~/.local/state/rtr/homes/<tool>/<profile>/`
-- **Fresh skills sync** — each run replaces `<profile home>/skills` from the
-  tool default or configured source
+- **Fresh skills sync** — each run replaces only `<profile home>/skills` from
+  the tool default or configured source
 - **Simple onboarding** — `rtr add` creates a profile and launches the tool to
   log in inside its native home
 - **Subscription profiles** — choose one profile with `--profile/-p` or use
@@ -60,8 +60,26 @@ rtr codex --profile personal
 rtr claude --profile work
 ```
 
+## Why it works
+
 The login state stays inside that profile's `CODEX_HOME` or
 `CLAUDE_CONFIG_DIR`. Global `~/.codex` and shared Claude config are not mutated.
+For Claude, rtr sets both config and secure-storage namespaces to the same home:
+
+```text
+CODEX_HOME=<state>/homes/codex/<profile>
+CLAUDE_CONFIG_DIR=<state>/homes/claude/<profile>
+CLAUDE_SECURESTORAGE_CONFIG_DIR=<state>/homes/claude/<profile>
+<native home>/skills refreshed before launch
+```
+
+For Claude Code, `CLAUDE_CONFIG_DIR` is the documented user config boundary for
+settings, app state, session history, plugins, and side-by-side accounts. Claude
+stores credential files there on Linux and Windows; on macOS the credential
+secret remains in Keychain. Claude Code 2.1.205 qualifies its Keychain service
+by config directory, so each `rtr` profile still gets a distinct login entry.
+`rtr` pins both Claude config and secure-storage namespaces to that boundary but
+never reads or copies Claude credentials.
 
 ## Commands
 
@@ -169,6 +187,19 @@ Normal launches do not create a run directory. With `--log`, rtr creates:
 `output.log` contains the child's stdout/stderr transcript. `rtr.log` contains
 proxy diagnostics. Both are opt-in; `--log` can degrade full-screen TUIs.
 `RTR_LOG` controls the diagnostics filter for that explicit logging path.
+
+First-class profile homes live under
+`~/.local/state/rtr/homes/<tool>/<profile>/`. `rtr codex` sets `CODEX_HOME` to
+that directory; `rtr claude` sets `CLAUDE_CONFIG_DIR`. First-class runs do not
+mutate global `~/.codex` or shared Claude config. Before launching, they replace
+`<profile home>/skills` from `skills_source` when configured, otherwise from
+`~/.codex/skills` or `~/.claude/skills`. Explicit sources must exist; missing
+defaults simply leave no synced skills. Relative `skills_source` paths resolve
+from the rtr config directory. For Claude, this seeds personal skills only:
+settings, commands, agents, plugins, auth state, and sessions stay owned by the
+selected profile. Project `.claude/skills` and other project configuration still
+load from the working tree. Symlinked skill directories remain linked to their
+original targets after the copy.
 
 ## Trust model
 

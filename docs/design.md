@@ -18,6 +18,17 @@ Each points at `~/.local/state/rtr/homes/<tool>/<profile>/`. rtr creates those
 directories owner-only and refreshes their skills from the tool default or a
 configured `skills_source`.
 
+Claude Code treats `CLAUDE_CONFIG_DIR` as its user config boundary for settings,
+app state, session history, plugins, and multiple accounts. Credential files are
+also stored there on Linux and Windows; macOS keeps credential secrets in the
+system Keychain. Claude Code 2.1.205 path-qualifies the Keychain service by
+config directory, preserving distinct login entries across rtr profiles. rtr
+therefore sets both `CLAUDE_CONFIG_DIR` and
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` to the selected native boundary without
+reading or copying credentials. Only personal `skills/` are seeded from shared
+state. Commands, agents, plugins, settings, and sessions remain profile-owned,
+while project `.claude/*` files continue to load from the working tree.
+
 The proxy intercepts only target hosts. Everything outside the scope is blind
 tunneled end-to-end. First-class Claude/Codex commands use built-in target hosts
 and empty rewrites. Legacy/custom `rtr run` uses configured hosts and the active
@@ -50,8 +61,17 @@ removable with `rtr untrust`.
   the atomic check-and-write; the losing add never prepares a home or launches.
 - **Native homes own identity.** Login, refresh, account, config, and session
   state move together instead of being approximated with header replacement.
+- **Claude secure storage follows the selected home.** Claude 2.1.205 lets
+  `CLAUDE_SECURESTORAGE_CONFIG_DIR` override the path used to qualify its
+  Keychain service. rtr pins it to `CLAUDE_CONFIG_DIR` so inherited values cannot
+  merge isolated profiles.
 - **Skills are replaced, not merged.** Every run starts from the configured
-  source without stale destination files.
+  source without stale destination files. Claude external relative links become
+  absolute without resolving aliases; internal and dangling links stay verbatim,
+  and Codex link text is unchanged.
+- **Claude inheritance stops at skills.** User commands, agents, plugins,
+  settings, auth state, and sessions are not copied from `~/.claude`; project
+  `.claude/*` discovery is unchanged.
 - **No runtime request capture.** The proxy only decides interception and
   applies rewrites; it has no sink for original headers.
 - **Default runs are artifact-free.** Per-run directories exist only when the
@@ -74,6 +94,28 @@ removable with `rtr untrust`.
   clients.
 - **Keeping request recording but hiding its banner** — still persists secrets
   and fails the privacy goal.
+
+## Verified Claude Code contract
+
+- [Environment variables](https://code.claude.com/docs/en/env-vars) documents
+  `CLAUDE_CONFIG_DIR` as the override for user settings, session history,
+  plugins, and non-macOS credential files, intended for side-by-side accounts.
+- [The `.claude` directory](https://code.claude.com/docs/en/claude-directory)
+  separates global user state from project `.claude/*` state and lists the
+  application data held under the user config boundary.
+- [Skills](https://code.claude.com/docs/en/slash-commands) documents personal
+  skills at `~/.claude/skills/<name>/SKILL.md` and supports symlinked skill
+  directories in Claude Code 2.1.203 and later.
+- [Authentication](https://code.claude.com/docs/en/team) documents macOS
+  Keychain storage and config-directory credential files on Linux and Windows.
+- Claude Code 2.1.205 was also checked locally: a temporary
+  `CLAUDE_CONFIG_DIR` received `.claude.json`, backups, and a generated
+  `skills/<name>` plugin, and a second temporary directory had independent app
+  state. The default config reported its existing login while both temporary
+  config dirs reported no login, and the macOS Keychain showed distinct
+  `Claude Code-credentials-<suffix>` services. Inspection of the installed
+  executable confirmed the suffix is derived from the normalized secure-storage
+  config path and that `CLAUDE_SECURESTORAGE_CONFIG_DIR` takes precedence.
 
 ## Non-goals
 
