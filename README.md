@@ -17,6 +17,8 @@ state or changing system-wide networking.
   `~/.local/state/rtr/homes/<tool>/<profile>/`
 - **Fresh skills sync** — each run replaces `<profile home>/skills` from the
   tool default or configured source
+- **Simple onboarding** — `rtr add` creates a profile and launches the tool to
+  log in inside its native home
 - **Subscription profiles** — choose one profile with `--profile/-p` or use
   equal round-robin selection across enabled profiles
 - **Process-scoped proxy** — only the spawned child gets proxy and CA env vars;
@@ -46,19 +48,12 @@ different `PREFIX`.
 ```sh
 rtr init
 rtr trust
+rtr add codex --profile personal
+rtr add claude --profile work
 ```
 
-Add at least one profile to `~/.config/rtr/config.toml`:
-
-```toml
-[tools.codex.profiles.personal]
-enabled = true
-
-[tools.claude.profiles.work]
-enabled = true
-```
-
-Then launch the selected native home and complete the tool's login flow there:
+`rtr add` creates the profile and immediately launches the selected native home
+for the tool's login flow. Run it again later with:
 
 ```sh
 rtr codex --profile personal
@@ -73,6 +68,8 @@ The login state stays inside that profile's `CODEX_HOME` or
 ```sh
 rtr init [--force]
 
+rtr add claude --profile work
+rtr add codex --profile personal
 rtr claude
 rtr claude --profile work
 rtr claude -p work
@@ -149,19 +146,6 @@ First-class runs ignore stored header rewrites and use the selected native home
 as the identity boundary. If `skills_source` is omitted, rtr uses
 `~/.codex/skills` or `~/.claude/skills`; a missing default means no synced
 skills. Relative sources resolve from the rtr config directory.
-
-## Legacy offline import
-
-`rtr import --from-capture` remains only for importing historical request JSONL
-into legacy/custom header-rewrite profiles. rtr no longer produces these files,
-and first-class Claude/Codex profiles do not need them.
-
-```sh
-rtr import claude --profile work --from-capture /path/to/requests.jsonl
-rtr import codex --profile personal --from-capture /path/to/requests.jsonl
-```
-
-Import and `rtr show` redact secret values unless `--show-secrets` is requested.
 
 ## State and logs
 

@@ -43,6 +43,11 @@ removable with `rtr untrust`.
 
 ## Key decisions
 
+- **Add is onboarding for first-class profiles.** `rtr add <tool> --profile
+  <name>` creates a new empty enabled profile, prepares its native home and
+  skills, then launches the tool for login through the normal runtime path.
+- **Duplicate adds fail before mutation.** A cross-process config lock protects
+  the atomic check-and-write; the losing add never prepares a home or launches.
 - **Native homes own identity.** Login, refresh, account, config, and session
   state move together instead of being approximated with header replacement.
 - **Skills are replaced, not merged.** Every run starts from the configured
@@ -51,9 +56,6 @@ removable with `rtr untrust`.
   applies rewrites; it has no sink for original headers.
 - **Default runs are artifact-free.** Per-run directories exist only when the
   user asks for `--log`.
-- **Historical import is isolated.** `rtr import --from-capture` can still read
-  older compatible JSONL for legacy profiles, but normal runs never generate
-  that data.
 - **Host-scoped interception is the default.** Fixed Claude/Codex scopes and
   explicit custom scopes keep the forged-certificate surface narrow.
 - **WebSocket compression is disabled on intercepted upgrades.** hudsucker
