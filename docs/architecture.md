@@ -1,146 +1,96 @@
 # Architecture
 
-`rtr` is a single Rust binary (library plus thin `main`) on Tokio.
-
-## Modules
+## Module Map
 
 | Module | Responsibility |
-| --- | --- |
-| `cli` | Clap command surface and the `rtr <tool>` alias. |
-| `config` | `config.toml` model, starter config, and switch resolution. |
-| `tool_specs` | Claude/Codex runtime hosts, native-home env keys, and default skills sources. |
-| `profiles` | Redacted profile rendering plus `ls` and `show` commands. |
-| `selection` | Enabled-profile validation and round-robin advancement. |
-| `usage` | Usage JSONL, local-day filtering, and stats rendering. |
-| `state` | Legacy active profiles and round-robin cursors. |
-| `rewrite` | Header set/remove validation, host matching, and redaction. |
-| `ca` | Local CA generation, loading, and authority construction. |
-| `keychain` | macOS trust installation, removal, and detection. |
-| `proxy` | Host-scoped hudsucker handler and server lifecycle. |
-| `runner` | Profile creation, native-home preparation, child launch, optional tee, proxy lifecycle, and status. |
-| `paths` | Config, state, CA, profile-home, and opt-in log paths. |
+|---|---|
+| `cli` | First-class Claude/Codex launch and inspection command parsing |
+| `config` | Strict TOML schema, starter config, and atomic profile table creation |
+| `tool_specs` | Native-home variables and skills relocation policy per tool |
+| `selection` | Enabled-profile validation and round-robin choice |
+| `state` | Locked, atomic round-robin cursor persistence |
+| `paths` | Config/state resolution, private directories, safe profile paths |
+| `runner` | Profile creation, native-home preparation, skills refresh, direct child execution |
+| `profiles` | Profile list, show, and status rendering |
+| `usage` | Locked JSONL events and aggregate statistics |
+| `file_lock` | Shared advisory locking and atomic private-file writes |
 
-## First-class subscription flow
-
-`rtr add <tool> --profile <name>` resolves the first-class tool spec and rejects
-unsupported tools or duplicate profiles before touching the native home. It
-persists an empty enabled profile atomically under a cross-process lock, then
-enters the normal forced-profile run path.
-
-`rtr claude` and `rtr codex` select a configured profile. A forced
-`--profile/-p` is validated without mutating state; otherwise selection advances
-the per-tool round-robin cursor under a lock.
-
-The runner creates the selected native home, refreshes its skills directory,
-injects `CODEX_HOME` or Claude's `CLAUDE_CONFIG_DIR` plus
-`CLAUDE_SECURESTORAGE_CONFIG_DIR`, and launches the configured command plus user
-args. First-class runs use built-in runtime hosts and an empty rewrite set, so
-native tool state remains the identity source of truth. A usage event is appended
-after the child finishes or launch fails.
-
-For Claude, the native home is the complete user config boundary selected by
-`CLAUDE_CONFIG_DIR`, not a skills-only directory. Claude writes user settings,
-app state, sessions, and plugin data there. `rtr` seeds only `skills/`; it does
-not inherit user commands, agents, plugins, settings, or auth from the default
-`~/.claude`. Project `.claude/*` discovery remains rooted in the working tree.
-On macOS, Claude's credential secret remains in Keychain even though the config
-directory selects the side-by-side account context. In verified Claude Code
-2.1.205 behavior, each config directory uses a distinct path-qualified Keychain
-service. rtr sets the secure-storage namespace to the selected profile path so
-an inherited override cannot collapse profiles onto one Keychain entry; rtr
-does not access those entries itself.
-
-For Codex, the child keeps `HOME` and the working directory. Codex therefore
-discovers canonical personal skills from `$HOME/.agents/skills`, repository
-skills from `.agents/skills`, and admin skills from `/etc/codex/skills` without
-rtr copying them. The runner bridges a distinct legacy `~/.codex/skills` or
-external configured source into the selected profile, but skips an inherited
-source, excludes source `.system`, and preserves the selected home's Codex-owned
-`.system` cache. Claude keeps the generic fresh-copy path.
-
-## Legacy run flow
+## Runtime Sequence
 
 ```text
-load config + state
-  -> resolve active profile into Rewrites
-  -> load or mint the local CA
-  -> bind the loopback proxy
-  -> spawn the child with proxy and CA env
-  -> wait for child
-  -> stop proxy
-  -> propagate child exit code
+CLI
+ └─ runner::run_subscription_tool
+     ├─ Config::load
+     ├─ tool_specs::get
+     ├─ selection::select_profile
+     ├─ Paths::ensure_profile_home_dir
+     ├─ sync_profile_skills
+     ├─ tokio::process::Command::spawn + signal-aware wait
+     └─ usage::append_event
 ```
 
-The child receives proxy variables pointing at the bound loopback port and CA
-variables pointing at rtr's certificate. `NO_PROXY` is cleared for that child.
-Normal stdio is inherited. `--log` pipes stdout/stderr through a tee and creates
-the run directory before proxy startup.
+Automatic selection and profile preparation run inside the state lock. The
+closure returns the prepared immutable arguments and environment; state is
+saved only when that closure succeeds. Child execution happens after releasing
+the state lock so a long-running CLI does not block another profile launch.
 
-The first-class path replaces legacy active-profile resolution with forced or
-round-robin selection, uses the spec runtime hosts and empty rewrites, prepares
-the native home and skills, and pins Claude's secure-storage namespace to the
-same home.
+## Process Contract
 
-## Request path
+The configured command owns the executable and immutable leading arguments.
+Runtime arguments are appended exactly once. The runner adds the tool-specific
+identity variables:
+
+| Tool | Variable |
+|---|---|
+| Claude | `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR` |
+| Codex | `CODEX_HOME` |
+
+The child inherits stdio and its numeric exit status. rtr forwards SIGINT,
+SIGTERM, SIGHUP, and SIGQUIT received while waiting. On Unix, signal exits use
+the shell convention `128 + signal`.
+
+Claude receives `CLAUDE_CONFIG_DIR` and
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` set to the same home. Only `skills/` is seeded;
+settings, commands, agents, plugins, auth state, and sessions remain owned by
+that profile, while project `.claude/*` discovery remains rooted in the working
+tree.
+
+Codex keeps `HOME` and the working directory. Its canonical
+`$HOME/.agents/skills`, repository, and admin roots remain native; rtr bridges a
+distinct legacy or configured root into the selected home while excluding
+source `.system` and preserving Codex's generated `.system` cache.
+
+## Filesystem Contract
 
 ```text
-child -> CONNECT target -> proxy
-  host outside scope -> blind tunnel
-  host inside scope  -> MITM with rtr CA
-    -> apply configured header rewrites
-    -> remove WebSocket compression negotiation when needed
-    -> forward upstream
+$RTR_CONFIG_DIR/
+└── config.toml
+
+$RTR_STATE_DIR/
+├── homes/
+│   ├── claude/<profile>/      # config and secure-storage namespace
+│   └── codex/<profile>/
+├── state.toml
+└── usage.jsonl
 ```
 
-The proxy does not persist requests or headers. Plain HTTP requests and
-decrypted HTTPS requests share the same host-match and rewrite path.
+Directories containing profile state are real directories with `0700`
+permissions. Config, state, locks, and usage files use owner-only permissions.
+Unsafe profile-name bytes are percent-encoded into deterministic path segments.
 
-For legacy/custom tools, `hosts = ["*"]` or an omitted host list matches every
-host reached by the spawned child. First-class commands use their fixed runtime
-scope regardless of configured `hosts`.
+## Failure Boundaries
 
-## On-disk layout
+- Config and profile validation happen before filesystem or process changes.
+- Skills refresh errors preserve the previous destination.
+- Automatic cursor updates are not saved after preflight errors.
+- Spawn errors are returned with executable context and recorded without an
+  exit code.
+- Malformed historical usage lines are reported and skipped during stats.
 
-```text
-~/.config/rtr/
-  config.toml
-  ca/
-    rtr-ca.cert.pem
-    rtr-ca.key.pem
+## Test Boundaries
 
-~/.local/state/rtr/
-  state.toml
-  usage.jsonl
-  homes/
-    codex/<profile>/          # passed as CODEX_HOME
-      skills/                 # distinct legacy/configured skills only
-        .system/              # installed and refreshed by Codex
-    claude/<profile>/         # passed as CLAUDE_CONFIG_DIR
-      skills/                 # fresh copy from skills_source or ~/.claude/skills
-      .claude.json            # Claude-owned app/account state, created on use
-      settings.json           # optional, profile-owned user settings
-      projects/               # Claude-owned session history and memory
-      plugins/                # profile-owned installed plugin state
-```
-
-Default launches create no per-run artifact directory. Explicit `--log` adds:
-
-```text
-~/.local/state/rtr/runs/<tool>/<timestamp-pid>/
-  output.log
-  rtr.log
-```
-
-## Testing
-
-- Unit tests cover config, profile creation and rendering, selection, rewrites, CA, keychain,
-  paths, native-home preparation, Claude/Codex symlink policies, usage, and status.
-- `tests/proxy_e2e.rs` sends a real plain-HTTP proxy request and verifies the
-  upstream sees the rewritten header.
-- `tests/run_smoke.rs` verifies default artifact-free launches, opt-in tee
-  output, native-home injection, args, skills refresh, usage, rewrites, and exit
-  propagation, Claude secure-storage injection, and cross-profile state
-  isolation.
-- Codex-specific unit coverage verifies inherited-root deduplication, legacy
-  compatibility, profile config/auth isolation, `.system` ownership, rollback,
-  and usable relocated symlinks.
+Unit tests cover strict schemas, path encoding, locks, selection, skills copy,
+Claude/Codex symlink policies, profile rendering, and statistics.
+`tests/run_smoke.rs` launches real shell
+children to verify environment, argument order, skills refresh, cursor
+behavior, exit mapping, error recording, and absence of extra run artifacts.

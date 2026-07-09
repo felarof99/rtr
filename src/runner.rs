@@ -1,95 +1,21 @@
-//! `rtr run <tool>` starts the MITM proxy, launches the tool with proxy/CA env
-//! scoped to that child, and tears the proxy down when the child exits.
+//! Direct child execution with isolated native homes and synchronized skills.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::sync::{oneshot, Mutex};
+use tokio::signal::unix::{signal, Signal, SignalKind};
 
-use crate::config::{self, Config, Profile, Tool};
+use crate::config::{self, Config, Tool};
 use crate::paths::Paths;
-use crate::proxy::{self, RewriteHandler};
-use crate::rewrite::Rewrites;
 use crate::selection;
 use crate::state::State;
-use crate::{ca, keychain, tool_specs, usage};
-
-/// Environment injected into the child to scope interception to it alone.
-///
-/// Proxy vars route traffic; CA vars make OpenSSL/Node/Python/curl/git trust our
-/// CA without touching the keychain. `NO_PROXY` is cleared so target hosts are
-/// never excluded. Keychain-only verifiers (codex) still need `rtr trust`.
-pub fn proxy_env(port: u16, ca_cert: &Path) -> Vec<(String, String)> {
-    let proxy_url = format!("http://127.0.0.1:{port}");
-    let ca = ca_cert.to_string_lossy().into_owned();
-    let mut env: Vec<(String, String)> = Vec::new();
-    for key in [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        env.push((key.to_string(), proxy_url.clone()));
-    }
-    for key in ["NO_PROXY", "no_proxy"] {
-        env.push((key.to_string(), String::new()));
-    }
-    for key in [
-        "SSL_CERT_FILE",
-        "NODE_EXTRA_CA_CERTS",
-        "REQUESTS_CA_BUNDLE",
-        "CURL_CA_BUNDLE",
-        "GIT_SSL_CAINFO",
-    ] {
-        env.push((key.to_string(), ca.clone()));
-    }
-    env
-}
-
-/// Map a finished child's status to an exit code, mirroring shells: a
-/// signal-terminated child becomes `128 + signal` rather than a generic 1.
-fn exit_code(status: std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    status
-        .code()
-        .or_else(|| status.signal().map(|s| 128 + s))
-        .unwrap_or(1)
-}
-
-/// Human label for a tool's intercept scope. The wildcard/omitted case reads as
-/// `all hosts (*)` rather than an empty string or a literal `*` join.
-fn hosts_label(hosts: &[String]) -> String {
-    if crate::rewrite::matches_all_hosts(hosts) {
-        "all hosts (*)".to_string()
-    } else {
-        hosts.join(", ")
-    }
-}
+use crate::{tool_specs, usage};
 
 struct PreparedSubscriptionRun {
     profile_name: String,
     child_args: Vec<String>,
     child_env: Vec<(String, std::ffi::OsString)>,
-    rewrites: Rewrites,
-}
-
-struct PreparedToolRun {
-    tool_name: String,
-    tool: Tool,
-    hosts: Vec<String>,
-    profile: Option<String>,
-    rewrites: Rewrites,
-    child_args: Vec<String>,
-    child_env: Vec<(String, std::ffi::OsString)>,
-    log_output: bool,
 }
 
 #[derive(Debug)]
@@ -98,35 +24,94 @@ struct SkillsSource {
     explicit: bool,
 }
 
-/// Resolve the active profile's rewrites, bailing if the active name is unknown.
-fn resolve_rewrites(
-    cfg: &Config,
-    st: &State,
-    tool_name: &str,
-) -> Result<(Option<String>, Rewrites)> {
-    let tool = cfg.tool(tool_name)?;
-    let active = st.active_for(tool_name, cfg);
-    let profile =
-        match &active {
-            Some(name) => tool.profiles.get(name).cloned().with_context(|| {
-                format!("active profile '{name}' not found for tool '{tool_name}'")
-            })?,
-            None => Profile::default(),
-        };
-    let rewrites = Rewrites::from_profile(&profile).with_context(|| {
-        format!(
-            "profile '{}' for tool '{tool_name}' has an invalid header",
-            active.as_deref().unwrap_or("<none>")
-        )
-    })?;
-    Ok((active, rewrites))
+struct ChildSignals {
+    interrupt: Signal,
+    terminate: Signal,
+    hangup: Signal,
+    quit: Signal,
 }
 
-/// Build the selected profile's native-home env and immutable args for one run.
+/// Restore rtr's foreground terminal ownership after its child exits.
+struct ForegroundTerminal {
+    fd: i32,
+    original_process_group: i32,
+    restored: bool,
+}
+
+impl ForegroundTerminal {
+    fn handoff(process_group: i32) -> Result<Option<Self>> {
+        let fd = libc::STDIN_FILENO;
+        // SAFETY: these calls only read terminal state for a valid process fd.
+        if unsafe { libc::isatty(fd) } != 1 {
+            return Ok(None);
+        }
+        let original_process_group = unsafe { libc::tcgetpgrp(fd) };
+        if original_process_group < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("reading foreground process group");
+        }
+        // A background invocation must remain under the shell's job control.
+        if original_process_group != unsafe { libc::getpgrp() } {
+            return Ok(None);
+        }
+        set_foreground_process_group(fd, process_group)?;
+        Ok(Some(Self {
+            fd,
+            original_process_group,
+            restored: false,
+        }))
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if !self.restored {
+            set_foreground_process_group(self.fd, self.original_process_group)?;
+            self.restored = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ForegroundTerminal {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("rtr: could not restore foreground terminal: {error:#}");
+        }
+    }
+}
+
+impl ChildSignals {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("installing SIGINT handler")?,
+            terminate: signal(SignalKind::terminate()).context("installing SIGTERM handler")?,
+            hangup: signal(SignalKind::hangup()).context("installing SIGHUP handler")?,
+            quit: signal(SignalKind::quit()).context("installing SIGQUIT handler")?,
+        })
+    }
+
+    async fn recv(&mut self) -> i32 {
+        tokio::select! {
+            Some(()) = self.interrupt.recv() => libc::SIGINT,
+            Some(()) = self.terminate.recv() => libc::SIGTERM,
+            Some(()) = self.hangup.recv() => libc::SIGHUP,
+            Some(()) = self.quit.recv() => libc::SIGQUIT,
+        }
+    }
+}
+
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
+}
+
+/// Prepare the selected profile's native home, skills, environment, and arguments.
 fn prepare_subscription_run(
     paths: &Paths,
     spec: &tool_specs::ToolSpec,
-    tool: &crate::config::Tool,
+    tool: &Tool,
     profile_name: &str,
     runtime_args: &[String],
 ) -> Result<PreparedSubscriptionRun> {
@@ -144,39 +129,18 @@ fn prepare_subscription_run(
         profile_name: profile_name.to_string(),
         child_args: runtime_args.to_vec(),
         child_env,
-        // Native homes are the first-class identity boundary; header rewrites
-        // remain legacy/custom `rtr run` behavior.
-        rewrites: Rewrites::default(),
     })
 }
 
-/// Prepare the profile's native home and return the env passed to the child.
 fn prepare_native_profile_env(
     paths: &Paths,
     spec: &tool_specs::ToolSpec,
-    tool: &crate::config::Tool,
+    tool: &Tool,
     profile_name: &str,
 ) -> Result<Vec<(String, std::ffi::OsString)>> {
-    let home = prepare_native_profile_home(paths, spec, tool, profile_name)?;
-    Ok(native_profile_env_for_home(spec, home))
-}
-
-fn prepare_native_profile_home(
-    paths: &Paths,
-    spec: &tool_specs::ToolSpec,
-    tool: &crate::config::Tool,
-    profile_name: &str,
-) -> Result<PathBuf> {
     let home = paths.ensure_profile_home_dir(spec.name, profile_name)?;
     let user_home = crate::home_dir()?;
     sync_profile_skills(spec, tool, &home, &paths.config_dir, &user_home)?;
-    Ok(home)
-}
-
-fn native_profile_env_for_home(
-    spec: &tool_specs::ToolSpec,
-    home: PathBuf,
-) -> Vec<(String, std::ffi::OsString)> {
     let mut env = vec![(
         spec.native_home_env.to_string(),
         home.clone().into_os_string(),
@@ -184,13 +148,13 @@ fn native_profile_env_for_home(
     if let Some(key) = spec.native_secure_storage_env {
         env.push((key.to_string(), home.into_os_string()));
     }
-    env
+    Ok(env)
 }
 
-/// Refresh the selected native profile home with the tool's skills source.
+/// Refresh the selected native home from the tool's configured skills source.
 fn sync_profile_skills(
     spec: &tool_specs::ToolSpec,
-    tool: &crate::config::Tool,
+    tool: &Tool,
     profile_home: &Path,
     config_dir: &Path,
     home: &Path,
@@ -202,7 +166,7 @@ fn sync_profile_skills(
 
 fn sync_profile_skills_locked(
     spec: &tool_specs::ToolSpec,
-    tool: &crate::config::Tool,
+    tool: &Tool,
     profile_home: &Path,
     config_dir: &Path,
     home: &Path,
@@ -212,12 +176,10 @@ fn sync_profile_skills_locked(
 
     match std::fs::metadata(&source.path) {
         Ok(meta) if meta.is_dir() => {}
-        Ok(_) => {
-            bail!(
-                "skills source {} must be a directory",
-                source.path.display()
-            );
-        }
+        Ok(_) => bail!(
+            "skills source {} must be a directory",
+            source.path.display()
+        ),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound && !source.explicit => {
             if spec.name == "codex" {
                 replace_codex_user_skills(None, &destination, spec.rebase_external_skill_symlinks)?;
@@ -255,7 +217,6 @@ fn sync_profile_skills_locked(
     }
 }
 
-/// Return whether Codex already discovers this source through `$HOME/.agents/skills`.
 fn codex_inherits_skills_source(source: &Path, home: &Path) -> Result<bool> {
     let inherited = home.join(".agents/skills");
     if lexical_normalize(source).starts_with(lexical_normalize(&inherited)) {
@@ -263,9 +224,9 @@ fn codex_inherits_skills_source(source: &Path, home: &Path) -> Result<bool> {
     }
     let inherited = match inherited.canonicalize() {
         Ok(path) => path,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => {
-            return Err(err).with_context(|| format!("canonicalizing {}", inherited.display()));
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("canonicalizing {}", inherited.display()));
         }
     };
     let source = source
@@ -292,7 +253,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 
 fn skills_source(
     spec: &tool_specs::ToolSpec,
-    tool: &crate::config::Tool,
+    tool: &Tool,
     home: &Path,
     config_dir: &Path,
 ) -> Result<SkillsSource> {
@@ -397,7 +358,6 @@ fn replace_skills_dir(
     result
 }
 
-/// Install a staged skills tree and restore the previous tree on failure.
 fn install_staged_skills_dir(staged: &Path, destination: &Path) -> Result<()> {
     let backup = temporary_skills_backup_path(destination);
     remove_existing_path(&backup)?;
@@ -412,11 +372,13 @@ fn install_staged_skills_dir(staged: &Path, destination: &Path) -> Result<()> {
             })?;
             true
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-        Err(err) => return Err(err).with_context(|| format!("stat {}", destination.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| format!("stat {}", destination.display()));
+        }
     };
 
-    if let Err(install_err) = std::fs::rename(staged, destination) {
+    if let Err(install_error) = std::fs::rename(staged, destination) {
         if had_destination {
             let rollback = remove_existing_path(destination).and_then(|()| {
                 std::fs::rename(&backup, destination).with_context(|| {
@@ -427,18 +389,18 @@ fn install_staged_skills_dir(staged: &Path, destination: &Path) -> Result<()> {
                     )
                 })
             });
-            if let Err(rollback_err) = rollback {
+            if let Err(rollback_error) = rollback {
                 return Err(anyhow::anyhow!(
                     "installing staged skills {} at {} failed: {}; rollback failed: {}; previous skills remain at {}",
                     staged.display(),
                     destination.display(),
-                    install_err,
-                    rollback_err,
+                    install_error,
+                    rollback_error,
                     backup.display()
                 ));
             }
         }
-        return Err(install_err).with_context(|| {
+        return Err(install_error).with_context(|| {
             format!(
                 "installing staged skills {} at {}",
                 staged.display(),
@@ -453,7 +415,6 @@ fn install_staged_skills_dir(staged: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Replace Codex user skills while retaining the selected home's bundled-skill cache.
 fn replace_codex_user_skills(
     source: Option<&Path>,
     destination: &Path,
@@ -465,8 +426,10 @@ fn replace_codex_user_skills(
             std::fs::symlink_metadata(&system).ok().map(|_| system)
         }
         Ok(_) => None,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err).with_context(|| format!("stat {}", destination.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("stat {}", destination.display()));
+        }
     };
 
     if source.is_none() && system.is_none() {
@@ -495,12 +458,12 @@ fn replace_codex_user_skills(
 
 fn temporary_skills_path(destination: &Path) -> PathBuf {
     let stamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-    destination.with_file_name(format!(".skills.{}-{}.tmp", std::process::id(), stamp))
+    destination.with_file_name(format!(".skills.{}-{stamp}.tmp", std::process::id()))
 }
 
 fn temporary_skills_backup_path(destination: &Path) -> PathBuf {
     let stamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
-    destination.with_file_name(format!(".skills.{}-{}.backup", std::process::id(), stamp))
+    destination.with_file_name(format!(".skills.{}-{stamp}.backup", std::process::id()))
 }
 
 fn copy_dir_contents(
@@ -607,9 +570,9 @@ fn copied_symlink_target(
         .join(&target);
     let resolved = match target_path.canonicalize() {
         Ok(resolved) => resolved,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(target),
-        Err(err) => {
-            return Err(err)
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+        Err(error) => {
+            return Err(error)
                 .with_context(|| format!("resolving symlink target for {}", source.display()));
         }
     };
@@ -621,58 +584,23 @@ fn copied_symlink_target(
     }
 }
 
-/// Launch the tool with interception. Returns the child's exit code.
-pub async fn run_tool(
-    paths: &Paths,
-    tool_name: &str,
-    extra_args: &[String],
-    log_output: bool,
-) -> Result<i32> {
-    let cfg_path = paths.config_file();
-    if !cfg_path.exists() {
-        bail!("no config at {} — run `rtr init` first", cfg_path.display());
-    }
-    let cfg = Config::load(&cfg_path)?;
-    let tool = cfg.tool(tool_name)?.clone();
-    if tool.command.is_empty() {
-        bail!("tool '{tool_name}' has an empty command");
-    }
-    let st = State::load(&paths.state_file())?;
-    let (active, rewrites) = resolve_rewrites(&cfg, &st, tool_name)?;
-
-    let hosts = tool.hosts.clone();
-    run_prepared_tool(
-        paths,
-        &cfg,
-        PreparedToolRun {
-            tool_name: tool_name.to_string(),
-            tool,
-            hosts,
-            profile: active,
-            rewrites,
-            child_args: extra_args.to_vec(),
-            child_env: Vec::new(),
-            log_output,
-        },
-    )
-    .await
-}
-
-/// Launch a first-class subscription tool, selecting a profile for this run and recording usage.
+/// Launch one selected profile directly and record its outcome.
 pub async fn run_subscription_tool(
     paths: &Paths,
     tool_name: &str,
     forced_profile: Option<&str>,
     runtime_args: &[String],
-    log_output: bool,
 ) -> Result<i32> {
     let spec = tool_specs::get(tool_name)?;
-    let cfg_path = paths.config_file();
-    if !cfg_path.exists() {
-        bail!("no config at {} — run `rtr init` first", cfg_path.display());
+    let config_path = paths.config_file();
+    if !config_path.exists() {
+        bail!(
+            "no config at {} — run `rtr init` first",
+            config_path.display()
+        );
     }
-    let cfg = Config::load(&cfg_path)?;
-    let tool = cfg.tool(spec.name)?.clone();
+    let config = Config::load(&config_path)?;
+    let tool = config.tool(spec.name)?.clone();
     if tool.command.is_empty() {
         bail!("tool '{}' has an empty command", spec.name);
     }
@@ -687,27 +615,14 @@ pub async fn run_subscription_tool(
         })?
     };
 
-    let result = run_prepared_tool(
-        paths,
-        &cfg,
-        PreparedToolRun {
-            tool_name: spec.name.to_string(),
-            tool,
-            hosts: tool_specs::runtime_hosts(spec),
-            profile: Some(prepared.profile_name.clone()),
-            rewrites: prepared.rewrites,
-            child_args: prepared.child_args,
-            child_env: prepared.child_env,
-            log_output,
-        },
-    )
-    .await;
-
-    let exit_code = result.as_ref().ok().copied();
-    usage::append_event(
+    let result = execute_tool(&tool, prepared.child_args, prepared.child_env).await;
+    let child_exit_code = result.as_ref().ok().copied();
+    if let Err(error) = usage::append_event(
         &paths.usage_file(),
-        &usage::new_event(spec.name, &prepared.profile_name, exit_code),
-    )?;
+        &usage::new_event(spec.name, &prepared.profile_name, child_exit_code),
+    ) {
+        eprintln!("rtr: could not record usage: {error:#}");
+    }
     result
 }
 
@@ -718,11 +633,14 @@ pub async fn add_subscription_profile(
     profile_name: &str,
 ) -> Result<i32> {
     let spec = tool_specs::get(tool_name)?;
-    let cfg_path = paths.config_file();
-    if !cfg_path.exists() {
-        bail!("no config at {} — run `rtr init` first", cfg_path.display());
+    let config_path = paths.config_file();
+    if !config_path.exists() {
+        bail!(
+            "no config at {} — run `rtr init` first",
+            config_path.display()
+        );
     }
-    persist_new_subscription_profile(&cfg_path, spec, profile_name)?;
+    persist_new_subscription_profile(&config_path, spec, profile_name)?;
     println!("Added profile: {}/{}", spec.name, profile_name);
     println!(
         "Native home: {}={}",
@@ -731,7 +649,7 @@ pub async fn add_subscription_profile(
     );
     println!("Launching {} to sign in...", spec.name);
 
-    let exit_code = run_subscription_tool(paths, spec.name, Some(profile_name), &[], false).await?;
+    let exit_code = run_subscription_tool(paths, spec.name, Some(profile_name), &[]).await?;
     println!();
     println!(
         "Run this profile again with: rtr {} --profile {}",
@@ -741,16 +659,14 @@ pub async fn add_subscription_profile(
     Ok(exit_code)
 }
 
-/// Persist one new profile while serializing duplicate checks across processes.
 fn persist_new_subscription_profile(
-    cfg_path: &Path,
+    config_path: &Path,
     spec: &tool_specs::ToolSpec,
     profile_name: &str,
 ) -> Result<()> {
-    let lock_path = crate::file_lock::lock_path(cfg_path);
-    crate::file_lock::with_exclusive_lock(&lock_path, || {
-        let mut cfg = Config::load(cfg_path)?;
-        let tool = cfg.tool(spec.name)?;
+    crate::file_lock::with_exclusive_lock(&crate::file_lock::lock_path(config_path), || {
+        let mut config = Config::load(config_path)?;
+        let tool = config.tool(spec.name)?;
         if tool.command.is_empty() {
             bail!("tool '{}' has an empty command", spec.name);
         }
@@ -763,8 +679,7 @@ fn persist_new_subscription_profile(
                 shell_quote(profile_name)
             );
         }
-
-        config::ensure_profile_entry_in_file(cfg_path, &mut cfg, spec.name, profile_name)?;
+        config::ensure_profile_entry_in_file(config_path, &mut config, spec.name, profile_name)?;
         Ok(())
     })
 }
@@ -773,229 +688,89 @@ fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
     }
-    if value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'@'))
-    {
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':' | b'@')
+    }) {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Launch one fully resolved tool run through the scoped proxy.
-async fn run_prepared_tool(paths: &Paths, cfg: &Config, prepared: PreparedToolRun) -> Result<i32> {
-    let PreparedToolRun {
-        tool_name,
-        tool,
-        hosts,
-        profile,
-        rewrites,
-        child_args,
-        child_env,
-        log_output,
-    } = prepared;
-    let ca = ca::load_or_generate(&paths.ca_cert(), &paths.ca_key())?;
-    let authority = ca.authority()?;
-
-    if !keychain::is_trusted(&ca.cert_path) {
-        eprintln!("rtr: CA is not trusted in your keychain yet.");
-        eprintln!("     Keychain-verifying tools (e.g. codex) need a one-time: rtr trust");
-    }
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], cfg.proxy.port));
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding proxy on {addr} (another rtr already running?)"))?;
-    let port = listener.local_addr()?.port();
-
-    let run_dir = if log_output {
-        let stamp = format!(
-            "{}-{}",
-            chrono::Local::now().format("%Y%m%d-%H%M%S"),
-            std::process::id()
-        );
-        let run_dir = paths.run_dir(&tool_name, &stamp);
-        crate::paths::create_private_dir_all(&run_dir)?;
-        let log_path = run_dir.join("rtr.log");
-        crate::init_file_tracing(&log_path);
-        eprintln!("rtr: output -> {}", run_dir.join("output.log").display());
-        eprintln!("rtr: logs   -> {}", log_path.display());
-        Some(run_dir)
-    } else {
-        None
-    };
-    let handler = RewriteHandler::new(hosts.clone(), rewrites);
-
-    eprintln!(
-        "rtr: proxy on 127.0.0.1:{port} intercepting {}",
-        hosts_label(&hosts)
-    );
-    eprintln!("rtr: profile = {}", profile.as_deref().unwrap_or("(none)"));
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let proxy_task = tokio::spawn(proxy::serve(listener, authority, handler, async move {
-        let _ = shutdown_rx.await;
-    }));
-
+/// Run a configured tool with inherited stdio and wrapper-safe signal handling.
+async fn execute_tool(
+    tool: &Tool,
+    child_args: Vec<String>,
+    child_env: Vec<(String, std::ffi::OsString)>,
+) -> Result<i32> {
+    let mut signals = ChildSignals::new()?;
     let mut command = Command::new(&tool.command[0]);
-    command.args(&tool.command[1..]).args(&child_args);
-    for (k, v) in proxy_env(port, &ca.cert_path) {
-        command.env(k, v);
+    command.args(&tool.command[1..]).args(child_args);
+    for (key, value) in child_env {
+        command.env(key, value);
     }
-    for (k, v) in child_env {
-        command.env(k, v);
-    }
-    // If rtr's future is dropped (error/panic/cancellation), don't leave the
-    // child running against a proxy that's about to die.
+    command.process_group(0);
     command.kill_on_drop(true);
-
-    let code = if let Some(run_dir) = run_dir {
-        run_with_tee(&mut command, &run_dir.join("output.log")).await?
-    } else {
-        let status = command
-            .status()
-            .await
-            .with_context(|| format!("spawning '{}'", tool.command[0]))?;
-        exit_code(status)
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawning '{}'", tool.command[0]))?;
+    let child_pid = child.id().context("spawned child has no process id")? as i32;
+    let mut foreground_terminal = ForegroundTerminal::handoff(child_pid)?;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status.context("waiting for child")?,
+            forwarded = signals.recv() => {
+                if let Err(error) = forward_signal(child_pid, forwarded) {
+                    eprintln!("rtr: could not forward signal {forwarded} to child: {error}");
+                }
+            }
+        }
     };
-
-    let _ = shutdown_tx.send(());
-    match proxy_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("rtr: proxy stopped with error: {e:#}"),
-        Err(e) => eprintln!("rtr: proxy task did not join cleanly: {e}"),
+    if let Some(terminal) = &mut foreground_terminal {
+        if let Err(error) = terminal.restore() {
+            eprintln!("rtr: could not restore foreground terminal: {error:#}");
+        }
     }
-    Ok(code)
-}
-
-/// Spawn the child with piped stdio, tee'ing both streams to the terminal and a
-/// shared `output.log`.
-async fn run_with_tee(command: &mut Command, output_path: &Path) -> Result<i32> {
-    use std::os::unix::fs::OpenOptionsExt;
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().context("spawning child")?;
-
-    // 0600: the transcript may contain secrets the tool prints.
-    let std_log = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(output_path)
-        .with_context(|| format!("creating {}", output_path.display()))?;
-    let log = Arc::new(Mutex::new(tokio::fs::File::from_std(std_log)));
-
-    let stdout = child.stdout.take().context("child stdout missing")?;
-    let stderr = child.stderr.take().context("child stderr missing")?;
-    let mut t_out = tokio::spawn(tee(stdout, true, log.clone()));
-    let mut t_err = tokio::spawn(tee(stderr, false, log.clone()));
-
-    let status = child.wait().await.context("waiting for child")?;
-
-    // Drain remaining buffered output, but don't hang forever if a grandchild
-    // inherited the pipe and outlives the child (EOF would never arrive).
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let _ = tokio::join!(&mut t_out, &mut t_err);
-    })
-    .await;
-    if drained.is_err() {
-        t_out.abort();
-        t_err.abort();
-        tracing::warn!("child exited but its output pipe stayed open; stopped tee after 2s");
-    }
-
     Ok(exit_code(status))
 }
 
-/// `rtr status`: gather config/state/CA/trust and print a human summary.
-pub fn print_status(paths: &Paths, tool_filter: Option<&str>) -> Result<()> {
-    let cfg = Config::load(&paths.config_file())?;
-    let st = State::load(&paths.state_file())?;
-    let ca = ca::load_or_generate(&paths.ca_cert(), &paths.ca_key())?;
-    let fingerprint = ca.fingerprint()?;
-    let trusted = keychain::is_trusted(&ca.cert_path);
-    let out = render_status(
-        &cfg,
-        &st,
-        &ca.cert_path.display().to_string(),
-        &fingerprint,
-        trusted,
-        tool_filter,
-    )?;
-    print!("{out}");
-    Ok(())
+/// Forward a signal received by rtr to the child's process group.
+fn forward_signal(pid: i32, signal: i32) -> Result<()> {
+    // SAFETY: `kill` reads only the integer pid and signal values supplied here.
+    if unsafe { libc::kill(-pid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error).context("forwarding signal")
 }
 
-/// Pure renderer for `status`, kept separate so it can be asserted on.
-pub fn render_status(
-    cfg: &Config,
-    st: &State,
-    ca_path: &str,
-    fingerprint: &str,
-    trusted: bool,
-    tool_filter: Option<&str>,
-) -> Result<String> {
-    use std::fmt::Write as _;
-
-    if let Some(name) = tool_filter {
-        if !cfg.tools.contains_key(name) {
-            bail!("no tool named '{name}' in config.toml");
-        }
-    }
-
-    let mut s = String::new();
-    let _ = writeln!(s, "rtr status");
-    let _ = writeln!(s, "  proxy:          127.0.0.1:{}", cfg.proxy.port);
-    let _ = writeln!(s, "  CA cert:        {ca_path}");
-    let _ = writeln!(s, "  CA fingerprint: {fingerprint}");
-    let _ = writeln!(
-        s,
-        "  keychain trust: {}",
-        if trusted {
-            "trusted"
-        } else {
-            "NOT trusted — run `rtr trust`"
-        }
-    );
-    let _ = writeln!(s, "\ntools:");
-    for (name, tool) in &cfg.tools {
-        if tool_filter.is_some_and(|f| f != name) {
-            continue;
-        }
-        let active = st.active_for(name, cfg).unwrap_or_else(|| "(none)".into());
-        let profiles: Vec<&str> = tool.profiles.keys().map(String::as_str).collect();
-        let _ = writeln!(s, "  {name}  (active: {active})");
-        let _ = writeln!(s, "    command:  {}", tool.command.join(" "));
-        let _ = writeln!(s, "    hosts:    {}", hosts_label(&tool.hosts));
-        let _ = writeln!(s, "    profiles: {}", profiles.join(", "));
-    }
-    Ok(s)
-}
-
-async fn tee<R>(mut reader: R, to_stdout: bool, log: Arc<Mutex<tokio::fs::File>>) -> Result<()>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        let chunk = &buf[..n];
+fn set_foreground_process_group(fd: i32, process_group: i32) -> Result<()> {
+    // SAFETY: the signal-set pointers are valid for each call, and `tcsetpgrp`
+    // receives the controlling-terminal fd and an existing process-group id.
+    unsafe {
+        let mut blocked = std::mem::zeroed::<libc::sigset_t>();
+        let mut previous = std::mem::zeroed::<libc::sigset_t>();
+        if libc::sigemptyset(&mut blocked) != 0 || libc::sigaddset(&mut blocked, libc::SIGTTOU) != 0
         {
-            let mut f = log.lock().await;
-            f.write_all(chunk).await?;
-            f.flush().await?;
+            return Err(std::io::Error::last_os_error()).context("blocking SIGTTOU");
         }
-        if to_stdout {
-            let mut w = io::stdout();
-            w.write_all(chunk).await?;
-            w.flush().await?;
-        } else {
-            let mut w = io::stderr();
-            w.write_all(chunk).await?;
-            w.flush().await?;
+        let block_result = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous);
+        if block_result != 0 {
+            return Err(std::io::Error::from_raw_os_error(block_result))
+                .context("blocking SIGTTOU");
+        }
+        let result = libc::tcsetpgrp(fd, process_group);
+        let terminal_error = std::io::Error::last_os_error();
+        let restore_result =
+            libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        if restore_result != 0 {
+            return Err(std::io::Error::from_raw_os_error(restore_result))
+                .context("restoring signal mask");
+        }
+        if result != 0 {
+            return Err(terminal_error).context("setting foreground process group");
         }
     }
     Ok(())
@@ -1004,25 +779,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn toml_path(path: &Path) -> String {
         toml::Value::String(path.display().to_string()).to_string()
     }
 
     #[test]
-    fn proxy_env_sets_proxy_and_ca_vars() {
-        let env: HashMap<String, String> = proxy_env(62888, Path::new("/c/ca.pem"))
-            .into_iter()
-            .collect();
-        assert_eq!(env["HTTPS_PROXY"], "http://127.0.0.1:62888");
-        assert_eq!(env["https_proxy"], "http://127.0.0.1:62888");
-        assert_eq!(env["ALL_PROXY"], "http://127.0.0.1:62888");
-        assert_eq!(env["NO_PROXY"], "");
-        assert_eq!(env["SSL_CERT_FILE"], "/c/ca.pem");
-        assert_eq!(env["NODE_EXTRA_CA_CERTS"], "/c/ca.pem");
-        assert_eq!(env["CURL_CA_BUNDLE"], "/c/ca.pem");
-        assert_eq!(env["GIT_SSL_CAINFO"], "/c/ca.pem");
+    fn skills_source_defaults_to_tool_home_skills() {
+        let config = Config::parse("[tools.codex]\ncommand=[\"codex\"]\n").unwrap();
+        let source = skills_source(
+            tool_specs::get("codex").unwrap(),
+            config.tool("codex").unwrap(),
+            Path::new("/home/me"),
+            Path::new("/config"),
+        )
+        .unwrap();
+        assert!(!source.explicit);
+        assert_eq!(source.path, PathBuf::from("/home/me/.codex/skills"));
     }
 
     #[test]
@@ -1036,26 +810,21 @@ mod tests {
     #[test]
     fn concurrent_profile_creators_persist_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg_path = dir.path().join("config.toml");
-        config::write_secret_file(
-            &cfg_path,
-            "[tools.codex]\ncommand = [\"codex\"]\nselection = \"round-robin\"\n",
-        )
-        .unwrap();
-
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[tools.codex]\ncommand = [\"codex\"]\n").unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let handles: Vec<_> = (0..2)
             .map(|_| {
-                let barrier = barrier.clone();
-                let cfg_path = cfg_path.clone();
+                let barrier = Arc::clone(&barrier);
+                let config_path = config_path.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
                     persist_new_subscription_profile(
-                        &cfg_path,
+                        &config_path,
                         tool_specs::get("codex").unwrap(),
                         "personal",
                     )
-                    .map_err(|err| err.to_string())
+                    .map_err(|error| error.to_string())
                 })
             })
             .collect();
@@ -1065,64 +834,34 @@ mod tests {
             .collect();
 
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        let errors: Vec<&str> = results
-            .iter()
-            .filter_map(|result| result.as_ref().err().map(String::as_str))
-            .collect();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("already exists"), "{errors:?}");
-
-        let cfg = Config::load(&cfg_path).unwrap();
         assert_eq!(
-            cfg.tool("codex")
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .filter(|error| error.contains("already exists"))
+                .count(),
+            1
+        );
+        let config = Config::load(&config_path).unwrap();
+        assert_eq!(
+            config
+                .tool("codex")
                 .unwrap()
                 .profiles
                 .keys()
                 .collect::<Vec<_>>(),
             vec!["personal"]
         );
-        let text = std::fs::read_to_string(cfg_path).unwrap();
-        assert_eq!(text.matches("[tools.codex.profiles.personal]").count(), 1);
-    }
-
-    #[test]
-    fn resolve_rewrites_errors_on_unknown_active_profile() {
-        let cfg = Config::parse(
-            "[tools.t]\ncommand=[\"t\"]\nactive=\"ghost\"\n[tools.t.profiles.real]\nset={}\n",
-        )
-        .unwrap();
-        let st = State::default();
-        let err = resolve_rewrites(&cfg, &st, "t").unwrap_err().to_string();
-        assert!(err.contains("ghost"), "got: {err}");
-    }
-
-    #[test]
-    fn skills_source_defaults_to_legacy_tool_home_skills() {
-        let cfg = Config::parse("[tools.codex]\ncommand=[\"codex\"]\n").unwrap();
-        let tool = cfg.tool("codex").unwrap();
-        let spec = tool_specs::get("codex").unwrap();
-        let source =
-            skills_source(spec, tool, Path::new("/home/me"), Path::new("/config")).unwrap();
-        assert!(!source.explicit);
-        assert_eq!(source.path, PathBuf::from("/home/me/.codex/skills"));
-
-        let cfg = Config::parse("[tools.claude]\ncommand=[\"claude\"]\n").unwrap();
-        let tool = cfg.tool("claude").unwrap();
-        let spec = tool_specs::get("claude").unwrap();
-        let source =
-            skills_source(spec, tool, Path::new("/home/me"), Path::new("/config")).unwrap();
-        assert!(!source.explicit);
-        assert_eq!(source.path, PathBuf::from("/home/me/.claude/skills"));
     }
 
     #[test]
     fn skills_source_expands_configured_home_path() {
-        let cfg =
+        let config =
             Config::parse("[tools.codex]\ncommand=[\"codex\"]\nskills_source=\"~/.skills\"\n")
                 .unwrap();
         let source = skills_source(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             Path::new("/home/me"),
             Path::new("/config"),
         )
@@ -1132,35 +871,35 @@ mod tests {
     }
 
     #[test]
-    fn skills_source_resolves_relative_configured_path_from_config_dir() {
-        let cfg = Config::parse("[tools.codex]\ncommand=[\"codex\"]\nskills_source=\"skills\"\n")
-            .unwrap();
+    fn skills_source_resolves_relative_path_from_config_dir() {
+        let config =
+            Config::parse("[tools.codex]\ncommand=[\"codex\"]\nskills_source=\"skills\"\n")
+                .unwrap();
         let source = skills_source(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             Path::new("/home/me"),
             Path::new("/config/rtr"),
         )
         .unwrap();
-        assert!(source.explicit);
         assert_eq!(source.path, PathBuf::from("/config/rtr/skills"));
     }
 
     #[test]
-    fn skills_source_rejects_user_home_expansion() {
-        let cfg = Config::parse(
+    fn skills_source_rejects_unsupported_home_expansion() {
+        let config = Config::parse(
             "[tools.codex]\ncommand=[\"codex\"]\nskills_source=\"~someone/skills\"\n",
         )
         .unwrap();
-        let err = skills_source(
+        let error = skills_source(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             Path::new("/home/me"),
             Path::new("/config"),
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("~"), "got: {err}");
+        assert!(error.contains('~'), "{error}");
     }
 
     #[test]
@@ -1171,19 +910,17 @@ mod tests {
         std::fs::create_dir_all(source.join("nested")).unwrap();
         std::fs::create_dir_all(profile_home.join("skills")).unwrap();
         std::fs::write(source.join("root.md"), "root").unwrap();
-        std::fs::write(source.join("nested").join("child.md"), "child").unwrap();
-        std::fs::write(profile_home.join("skills").join("stale.md"), "stale").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("root.md", source.join("root-link")).unwrap();
+        std::fs::write(source.join("nested/child.md"), "child").unwrap();
+        std::fs::write(profile_home.join("skills/stale.md"), "stale").unwrap();
 
-        let cfg = Config::parse(&format!(
+        let config = Config::parse(&format!(
             "[tools.codex]\ncommand=[\"codex\"]\nskills_source={}\n",
             toml_path(&source)
         ))
         .unwrap();
         sync_profile_skills(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             &profile_home,
             dir.path(),
             Path::new("/home/me"),
@@ -1191,7 +928,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(profile_home.join("skills").join("root.md")).unwrap(),
+            std::fs::read_to_string(profile_home.join("skills/root.md")).unwrap(),
             "root"
         );
         assert_eq!(
@@ -1199,16 +936,11 @@ mod tests {
             "child"
         );
         assert!(!profile_home.join("skills/stale.md").exists());
-        #[cfg(unix)]
-        assert_eq!(
-            std::fs::read_link(profile_home.join("skills/root-link")).unwrap(),
-            PathBuf::from("root.md")
-        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn sync_profile_skills_keeps_external_relative_skill_links_usable() {
+    fn claude_sync_keeps_external_relative_skill_links_usable() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("home/.claude/skills");
         let skill_library = dir.path().join("skill-library");
@@ -1225,14 +957,14 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = Config::parse(&format!(
+        let config = Config::parse(&format!(
             "[tools.claude]\ncommand=[\"claude\"]\nskills_source={}\n",
             toml_path(&source)
         ))
         .unwrap();
         sync_profile_skills(
             tool_specs::get("claude").unwrap(),
-            cfg.tool("claude").unwrap(),
+            config.tool("claude").unwrap(),
             &profile_home,
             dir.path(),
             &dir.path().join("home"),
@@ -1263,14 +995,14 @@ mod tests {
         let target = "../../../skill-library/review";
         std::os::unix::fs::symlink(target, source.join("review")).unwrap();
 
-        let cfg = Config::parse(&format!(
+        let config = Config::parse(&format!(
             "[tools.codex]\ncommand=[\"codex\"]\nskills_source={}\n",
             toml_path(&source)
         ))
         .unwrap();
         sync_profile_skills(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             &profile_home,
             dir.path(),
             &dir.path().join("home"),
@@ -1291,14 +1023,14 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         std::os::unix::fs::symlink("missing-skill", source.join("dangling")).unwrap();
 
-        let cfg = Config::parse(&format!(
+        let config = Config::parse(&format!(
             "[tools.codex]\ncommand=[\"codex\"]\nskills_source={}\n",
             toml_path(&source)
         ))
         .unwrap();
         sync_profile_skills(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             &profile_home,
             dir.path(),
             dir.path(),
@@ -1319,29 +1051,26 @@ mod tests {
         let profile_home = dir.path().join("profile");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(profile_home.join("skills")).unwrap();
-        std::fs::write(profile_home.join("skills").join("stale.md"), "stale").unwrap();
+        std::fs::write(profile_home.join("skills/stale.md"), "stale").unwrap();
         assert!(std::process::Command::new("mkfifo")
             .arg(source.join("unsupported"))
             .status()
             .unwrap()
             .success());
 
-        let cfg = Config::parse(&format!(
+        let config = Config::parse(&format!(
             "[tools.codex]\ncommand=[\"codex\"]\nskills_source={}\n",
             toml_path(&source)
         ))
         .unwrap();
-        let err = sync_profile_skills(
+        assert!(sync_profile_skills(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             &profile_home,
             dir.path(),
             Path::new("/home/me"),
         )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("unsupported skills entry"), "got: {err}");
+        .is_err());
         assert_eq!(
             std::fs::read_to_string(profile_home.join("skills/stale.md")).unwrap(),
             "stale"
@@ -1351,21 +1080,19 @@ mod tests {
     #[test]
     fn sync_profile_skills_removes_destination_when_default_source_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
         let profile_home = dir.path().join("profile");
         std::fs::create_dir_all(profile_home.join("skills")).unwrap();
-        std::fs::write(profile_home.join("skills").join("stale.md"), "stale").unwrap();
+        std::fs::write(profile_home.join("skills/stale.md"), "stale").unwrap();
+        let config = Config::parse("[tools.codex]\ncommand=[\"codex\"]\n").unwrap();
 
-        let cfg = Config::parse("[tools.codex]\ncommand=[\"codex\"]\n").unwrap();
         sync_profile_skills(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             &profile_home,
             dir.path(),
-            &home,
+            &dir.path().join("home"),
         )
         .unwrap();
-
         assert!(!profile_home.join("skills").exists());
     }
 
@@ -1380,20 +1107,15 @@ mod tests {
         std::fs::create_dir_all(inherited.join("shared")).unwrap();
         std::fs::create_dir_all(&legacy_parent).unwrap();
         std::os::unix::fs::symlink(&inherited, legacy_parent.join("skills")).unwrap();
-        std::fs::write(
-            inherited.join("shared/SKILL.md"),
-            "---\nname: shared\ndescription: shared\n---\n",
-        )
-        .unwrap();
         std::fs::create_dir_all(profile_home.join("skills/shared")).unwrap();
         std::fs::create_dir_all(profile_home.join("skills/.system")).unwrap();
         std::fs::write(profile_home.join("skills/shared/SKILL.md"), "duplicate").unwrap();
         std::fs::write(profile_home.join("skills/.system/marker"), "current").unwrap();
 
-        let cfg = Config::parse("[tools.codex]\ncommand=[\"codex\"]\n").unwrap();
+        let config = Config::parse("[tools.codex]\ncommand=[\"codex\"]\n").unwrap();
         sync_profile_skills(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             &profile_home,
             dir.path(),
             &home,
@@ -1416,20 +1138,16 @@ mod tests {
         std::fs::create_dir_all(legacy.join("legacy")).unwrap();
         std::fs::create_dir_all(legacy.join(".system")).unwrap();
         std::fs::create_dir_all(profile_home.join("skills/.system")).unwrap();
-        std::fs::write(
-            legacy.join("legacy/SKILL.md"),
-            "---\nname: legacy\ndescription: legacy\n---\n",
-        )
-        .unwrap();
+        std::fs::write(legacy.join("legacy/SKILL.md"), "legacy").unwrap();
         std::fs::write(legacy.join(".system/stale"), "stale").unwrap();
         std::fs::write(home.join(".codex/config.toml"), "model = \"private\"").unwrap();
         std::fs::write(home.join(".codex/auth.json"), "secret").unwrap();
         std::fs::write(profile_home.join("skills/.system/current"), "current").unwrap();
 
-        let cfg = Config::parse("[tools.codex]\ncommand=[\"codex\"]\n").unwrap();
+        let config = Config::parse("[tools.codex]\ncommand=[\"codex\"]\n").unwrap();
         sync_profile_skills(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             &profile_home,
             dir.path(),
             &home,
@@ -1451,32 +1169,27 @@ mod tests {
         let profile_home = dir.path().join("profile");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(profile_home.join("skills/stale")).unwrap();
-        std::fs::write(
-            source.join("SKILL.md"),
-            "---\nname: shared\ndescription: shared\n---\n",
-        )
-        .unwrap();
+        std::fs::write(source.join("SKILL.md"), "shared").unwrap();
 
-        let cfg = Config::parse(&format!(
+        let config = Config::parse(&format!(
             "[tools.codex]\ncommand=[\"codex\"]\nskills_source={}\n",
             toml_path(&source)
         ))
         .unwrap();
         sync_profile_skills(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             &profile_home,
             dir.path(),
             &home,
         )
         .unwrap();
-
         assert!(!profile_home.join("skills").exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn codex_sync_skips_symlink_source_located_inside_inherited_skills() {
+    fn codex_sync_skips_symlink_source_inside_inherited_skills() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let inherited = home.join(".agents/skills");
@@ -1486,64 +1199,23 @@ mod tests {
         std::fs::create_dir_all(&inherited).unwrap();
         std::fs::create_dir_all(&target).unwrap();
         std::fs::create_dir_all(profile_home.join("skills/stale")).unwrap();
-        std::fs::write(
-            target.join("SKILL.md"),
-            "---\nname: shared\ndescription: shared\n---\n",
-        )
-        .unwrap();
+        std::fs::write(target.join("SKILL.md"), "shared").unwrap();
         std::os::unix::fs::symlink(&target, &source).unwrap();
 
-        let cfg = Config::parse(&format!(
+        let config = Config::parse(&format!(
             "[tools.codex]\ncommand=[\"codex\"]\nskills_source={}\n",
             toml_path(&source)
         ))
         .unwrap();
         sync_profile_skills(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             &profile_home,
             dir.path(),
             &home,
         )
         .unwrap();
-
         assert!(!profile_home.join("skills").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_sync_keeps_relocated_symlinked_skill_usable() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source");
-        let target = dir.path().join("shared/linked");
-        let profile_home = dir.path().join("profile");
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(
-            target.join("SKILL.md"),
-            "---\nname: linked\ndescription: linked\n---\n",
-        )
-        .unwrap();
-        std::os::unix::fs::symlink("../shared/linked", source.join("linked")).unwrap();
-
-        let cfg = Config::parse(&format!(
-            "[tools.codex]\ncommand=[\"codex\"]\nskills_source={}\n",
-            toml_path(&source)
-        ))
-        .unwrap();
-        sync_profile_skills(
-            tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
-            &profile_home,
-            dir.path(),
-            Path::new("/home/me"),
-        )
-        .unwrap();
-
-        assert!(profile_home.join("skills/linked/SKILL.md").is_file());
-        assert!(std::fs::read_link(profile_home.join("skills/linked"))
-            .unwrap()
-            .is_absolute());
     }
 
     #[test]
@@ -1556,20 +1228,19 @@ mod tests {
         std::fs::write(source.join(".SYSTEM/injected"), "source").unwrap();
         std::fs::write(profile_home.join("skills/.system/current"), "current").unwrap();
 
-        let cfg = Config::parse(&format!(
+        let config = Config::parse(&format!(
             "[tools.codex]\ncommand=[\"codex\"]\nskills_source={}\n",
             toml_path(&source)
         ))
         .unwrap();
         sync_profile_skills(
             tool_specs::get("codex").unwrap(),
-            cfg.tool("codex").unwrap(),
+            config.tool("codex").unwrap(),
             &profile_home,
             dir.path(),
             Path::new("/home/me"),
         )
         .unwrap();
-
         assert!(profile_home.join("skills/.system/current").is_file());
         assert!(!profile_home.join("skills/.SYSTEM/injected").exists());
     }
@@ -1582,135 +1253,13 @@ mod tests {
         std::fs::create_dir_all(&destination).unwrap();
         std::fs::write(destination.join("usable"), "previous").unwrap();
 
-        let err = install_staged_skills_dir(&missing_staged, &destination)
+        let error = install_staged_skills_dir(&missing_staged, &destination)
             .unwrap_err()
             .to_string();
-
-        assert!(err.contains("installing staged skills"), "got: {err}");
+        assert!(error.contains("installing staged skills"), "{error}");
         assert_eq!(
             std::fs::read_to_string(destination.join("usable")).unwrap(),
             "previous"
         );
-    }
-
-    #[test]
-    fn prepared_subscription_rewrites_leave_runtime_host_headers_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("empty-skills");
-        std::fs::create_dir_all(&source).unwrap();
-        let paths = Paths {
-            config_dir: dir.path().join("config"),
-            state_dir: dir.path().join("state"),
-        };
-        let tool = Config::parse(&format!(
-            r#"
-[tools.codex]
-command = ["codex"]
-skills_source = {}
-
-[tools.codex.profiles.personal]
-set = {{ Authorization = "Bearer stale", chatgpt-account-id = "stale-account" }}
-"#,
-            toml_path(&source)
-        ))
-        .unwrap()
-        .tool("codex")
-        .unwrap()
-        .clone();
-        let spec = tool_specs::get("codex").unwrap();
-        let prepared = prepare_subscription_run(&paths, spec, &tool, "personal", &[]).unwrap();
-        assert!(prepared.rewrites.is_empty());
-
-        let handler = RewriteHandler::new(tool_specs::runtime_hosts(spec), prepared.rewrites);
-        let req = hudsucker::hyper::Request::builder()
-            .method("POST")
-            .uri("https://chatgpt.com/backend-api/codex/session")
-            .header("authorization", "Bearer child")
-            .header("chatgpt-account-id", "child-account")
-            .body(hudsucker::Body::empty())
-            .unwrap();
-
-        let req = handler.apply(req);
-        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer child");
-        assert_eq!(
-            req.headers().get("chatgpt-account-id").unwrap(),
-            "child-account"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_with_tee_writes_output_log_and_returns_code() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("output.log");
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg("echo hello-from-child; echo errline 1>&2; exit 7");
-        let code = run_with_tee(&mut cmd, &out).await.unwrap();
-        assert_eq!(code, 7);
-        let log = std::fs::read_to_string(&out).unwrap();
-        assert!(log.contains("hello-from-child"), "log: {log}");
-        assert!(log.contains("errline"), "log: {log}");
-
-        // output.log holds tool output and must not be world-readable.
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "output.log perms {mode:o}");
-    }
-
-    #[tokio::test]
-    async fn signal_terminated_child_reports_128_plus_signal() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("output.log");
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg("kill -TERM $$");
-        let code = run_with_tee(&mut cmd, &out).await.unwrap();
-        assert_eq!(code, 128 + 15, "SIGTERM should map to 143, got {code}");
-    }
-
-    #[test]
-    fn render_status_shows_tools_and_trust() {
-        let cfg = Config::parse(crate::config::STARTER_CONFIG).unwrap();
-        let st = State::default();
-        let out = render_status(&cfg, &st, "/c/ca.pem", "AA:BB", false, None).unwrap();
-        assert!(out.contains("127.0.0.1:62888"), "{out}");
-        assert!(out.contains("AA:BB"), "{out}");
-        assert!(out.contains("NOT trusted"), "{out}");
-        assert!(out.contains("claude  (active: (none))"), "{out}");
-        assert!(out.contains(".anthropic.com"), "{out}");
-        assert!(out.contains("codex  (active: (none))"), "{out}");
-        assert!(out.contains("chatgpt.com"), "{out}");
-        assert!(out.contains("profiles:"), "{out}");
-
-        assert!(render_status(&cfg, &st, "/c/ca.pem", "AA", true, Some("ghost")).is_err());
-        let only = render_status(&cfg, &st, "/c/ca.pem", "AA", true, Some("codex")).unwrap();
-        assert!(only.contains("trusted"), "{only}");
-    }
-
-    #[test]
-    fn render_status_labels_wildcard_and_omitted_hosts_as_all() {
-        let cfg = Config::parse(
-            "[tools.star]\ncommand=[\"s\"]\nhosts=[\"*\"]\n[tools.bare]\ncommand=[\"b\"]\n",
-        )
-        .unwrap();
-        let st = State::default();
-        // Explicit "*" and an omitted hosts list both read as "all hosts (*)".
-        let star = render_status(&cfg, &st, "/c/ca.pem", "AA", false, Some("star")).unwrap();
-        assert!(star.contains("all hosts (*)"), "{star}");
-        let bare = render_status(&cfg, &st, "/c/ca.pem", "AA", false, Some("bare")).unwrap();
-        assert!(bare.contains("all hosts (*)"), "{bare}");
-    }
-
-    #[tokio::test]
-    async fn run_tool_requires_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths {
-            config_dir: dir.path().join("config"),
-            state_dir: dir.path().join("state"),
-        };
-        let err = run_tool(&paths, "codex", &[], false)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("rtr init"), "got: {err}");
     }
 }

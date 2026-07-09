@@ -26,7 +26,7 @@ pub type Stats = BTreeMap<String, BTreeMap<String, ProfileStats>>;
 
 pub fn new_event(tool: &str, profile: &str, exit_code: Option<i32>) -> UsageEvent {
     UsageEvent {
-        ts: chrono::Utc::now().to_rfc3339(),
+        ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         tool: tool.to_string(),
         profile: profile.to_string(),
         exit_code,

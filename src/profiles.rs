@@ -1,55 +1,27 @@
-use anyhow::{Context, Result};
+//! Profile inspection commands for the native launcher.
+
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
 
 use crate::config::{Config, Profile};
 use crate::paths::Paths;
 use crate::tool_specs;
 
-fn display_value(value: &str, show_secrets: bool) -> String {
-    if show_secrets {
-        value.to_string()
-    } else if let Some((scheme, _)) = value.split_once(' ') {
-        if scheme.eq_ignore_ascii_case("bearer") {
-            return format!("{scheme} <redacted>, len {}", value.len());
-        }
-        format!("<redacted>, len {}", value.len())
-    } else {
-        format!("<redacted>, len {}", value.len())
-    }
-}
-
-/// Render one profile while redacting stored secrets by default.
 pub fn render_profile(
     tool: &str,
     profile_name: &str,
     profile: &Profile,
-    show_secrets: bool,
+    native_home_env: &str,
+    native_home: &Path,
 ) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::new();
-    let _ = writeln!(out, "{tool}/{profile_name}");
-    let _ = writeln!(out, "  enabled: {}", profile.enabled);
-    if profile.set.is_empty() {
-        let _ = writeln!(out, "  rewrites: (none)");
-    } else {
-        let _ = writeln!(out, "  rewrites:");
-        for (name, value) in &profile.set {
-            let _ = writeln!(out, "    {name}: {}", display_value(value, show_secrets));
-        }
-    }
-    if !profile.remove.is_empty() {
-        let _ = writeln!(out, "  remove: {}", profile.remove.join(", "));
-    }
-    if !profile.metadata.is_empty() {
-        let _ = writeln!(out, "  metadata:");
-        for (name, value) in &profile.metadata {
-            let _ = writeln!(out, "    {name}: {}", display_value(value, show_secrets));
-        }
-    }
-    out
+    format!(
+        "{tool}/{profile_name}\n  enabled: {}\n  native home: {native_home_env}={}\n",
+        profile.enabled,
+        native_home.display()
+    )
 }
 
-/// Render the configured Claude and Codex profile inventory.
 pub fn render_profile_list(cfg: &Config) -> String {
     use std::fmt::Write as _;
 
@@ -68,13 +40,7 @@ pub fn render_profile_list(cfg: &Config) -> String {
                     } else {
                         "disabled"
                     };
-                    let rewrites: Vec<&str> = profile.set.keys().map(String::as_str).collect();
-                    let rewrites = if rewrites.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        rewrites.join(", ")
-                    };
-                    let _ = writeln!(out, "    {name} ({status}; rewrites: {rewrites})");
+                    let _ = writeln!(out, "    {name} ({status})");
                 }
             }
             None => {
@@ -85,29 +51,75 @@ pub fn render_profile_list(cfg: &Config) -> String {
     out
 }
 
-/// Print all configured Claude and Codex profiles.
 pub fn run_list_profiles(paths: &Paths) -> Result<()> {
     let cfg = Config::load(&paths.config_file())?;
     print!("{}", render_profile_list(&cfg));
     Ok(())
 }
 
-/// Print one profile target in `<tool>/<profile>` form.
-pub fn run_show_profile(paths: &Paths, target: &str, show_secrets: bool) -> Result<()> {
+pub fn run_show_profile(paths: &Paths, target: &str) -> Result<()> {
     let (tool_name, profile_name) = target
         .split_once('/')
         .with_context(|| format!("profile target '{target}' must look like <tool>/<profile>"))?;
-    tool_specs::get(tool_name)?;
+    let spec = tool_specs::get(tool_name)?;
     let cfg = Config::load(&paths.config_file())?;
-    let tool = cfg.tool(tool_name)?;
-    let profile = tool
+    let profile = cfg
+        .tool(tool_name)?
         .profiles
         .get(profile_name)
         .with_context(|| format!("tool '{tool_name}' has no profile '{profile_name}'"))?;
     print!(
         "{}",
-        render_profile(tool_name, profile_name, profile, show_secrets)
+        render_profile(
+            tool_name,
+            profile_name,
+            profile,
+            spec.native_home_env,
+            &paths.profile_home_dir(tool_name, profile_name),
+        )
     );
+    Ok(())
+}
+
+/// Render tool configuration and selected profiles without loading child state.
+pub fn render_status(cfg: &Config, tool_filter: Option<&str>) -> Result<String> {
+    use std::fmt::Write as _;
+
+    if let Some(name) = tool_filter {
+        if !cfg.tools.contains_key(name) {
+            bail!("no tool named '{name}' in config.toml");
+        }
+    }
+
+    let mut out = String::from("rtr status\n\ntools:\n");
+    for (name, tool) in &cfg.tools {
+        if tool_filter.is_some_and(|filter| filter != name) {
+            continue;
+        }
+        let profiles = tool
+            .profiles
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(out, "  {name}");
+        let _ = writeln!(out, "    command:  {}", tool.command.join(" "));
+        let _ = writeln!(
+            out,
+            "    profiles: {}",
+            if profiles.is_empty() {
+                "(none)"
+            } else {
+                &profiles
+            }
+        );
+    }
+    Ok(out)
+}
+
+pub fn print_status(paths: &Paths, tool_filter: Option<&str>) -> Result<()> {
+    let cfg = Config::load(&paths.config_file())?;
+    print!("{}", render_status(&cfg, tool_filter)?);
     Ok(())
 }
 
@@ -116,37 +128,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn profile_rendering_redacts_rewrites() {
-        let profile = Profile {
-            set: [("Authorization".to_string(), "Bearer secret".to_string())]
-                .into_iter()
-                .collect(),
-            metadata: [("x-organization-uuid".to_string(), "org-secret".to_string())]
-                .into_iter()
-                .collect(),
-            ..Profile::default()
-        };
-        let hidden = render_profile("claude", "work", &profile, false);
-        assert!(!hidden.contains("secret"), "{hidden}");
-        let shown = render_profile("claude", "work", &profile, true);
-        assert!(shown.contains("Bearer secret"), "{shown}");
-        assert!(shown.contains("org-secret"), "{shown}");
-    }
+    fn profile_views_contain_only_native_launcher_state() {
+        let cfg =
+            Config::parse("[tools.codex]\ncommand=[\"codex\"]\n[tools.codex.profiles.personal]\n")
+                .unwrap();
+        let list = render_profile_list(&cfg);
+        assert!(list.contains("personal (enabled)"), "{list}");
 
-    #[test]
-    fn profile_list_shows_profiles_only() {
-        let cfg = Config::parse(
-            r#"
-[tools.codex]
-command = ["codex"]
+        let profile = cfg.tool("codex").unwrap().profiles.get("personal").unwrap();
+        let shown = render_profile(
+            "codex",
+            "personal",
+            profile,
+            "CODEX_HOME",
+            Path::new("/state/homes/codex/personal"),
+        );
+        assert!(shown.contains("CODEX_HOME=/state/homes/codex/personal"));
 
-[tools.codex.profiles.personal]
-set = {}
-"#,
-        )
-        .unwrap();
-        let rendered = render_profile_list(&cfg);
-        assert!(rendered.contains("personal"), "{rendered}");
-        assert!(!rendered.contains("presets:"), "{rendered}");
+        let status = render_status(&cfg, None).unwrap();
+        assert!(status.contains("  codex\n"), "{status}");
+        for removed in ["proxy", "host", "CA", "trust", "rewrite", "capture"] {
+            assert!(!list.contains(removed), "{list}");
+            assert!(!shown.contains(removed), "{shown}");
+            assert!(!status.contains(removed), "{status}");
+        }
     }
 }
