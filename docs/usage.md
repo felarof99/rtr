@@ -40,9 +40,10 @@ Codex receives
 `CLAUDE_CONFIG_DIR=~/.local/state/rtr/homes/claude/<profile>/`. These directories
 are owner-only and isolated from the global tool homes.
 
-Before each launch, rtr replaces `<profile home>/skills` from `skills_source` or
-the tool default (`~/.codex/skills` or `~/.claude/skills`). A missing explicit
-source is an error; a missing default leaves the profile with no synced skills.
+Codex keeps the real `HOME`, so canonical personal, repository, and admin skills
+remain natively discoverable. rtr bridges only a distinct legacy or configured
+Codex root into the profile. Claude replaces `<profile home>/skills` from
+`skills_source` or `~/.claude/skills`. A missing explicit source is an error.
 
 ## Run profiles
 
@@ -53,6 +54,17 @@ rtr claude -p work
 rtr codex
 rtr codex --profile personal
 ```
+
+`rtr codex` creates/uses `~/.local/state/rtr/homes/codex/<profile>/` and sets
+`CODEX_HOME` for the child. `rtr claude` creates/uses
+`~/.local/state/rtr/homes/claude/<profile>/` and sets `CLAUDE_CONFIG_DIR`.
+Global `~/.codex` and shared Claude config are not mutated by first-class runs.
+
+Codex keeps the real `HOME`, so `$HOME/.agents/skills`, repository
+`.agents/skills`, `/etc/codex/skills`, and bundled skills remain available
+through Codex's native discovery. rtr only copies a distinct legacy
+`$HOME/.codex/skills` or external configured source into the profile. Claude
+retains fresh replacement from its default or configured source.
 
 Without `--profile`, rtr rotates equally across enabled profiles and persists
 the next cursor in `state.toml`. Forced selection validates the profile without
@@ -129,15 +141,20 @@ use built-in runtime scopes instead of configured `hosts` and do not apply
 stored header rewrites.
 
 First-class `rtr claude` and `rtr codex` runs refresh
-`<profile home>/skills` before launching. If `skills_source` is configured, that
-directory must exist and is copied after deleting the old destination. If it is
-omitted, rtr defaults to `~/.claude/skills` or `~/.codex/skills`; a missing
-default removes any stale destination and continues with no synced skills.
-Relative `skills_source` paths resolve from the rtr config directory. Claude
-skill folders may be symlinks; links within the copied tree keep their relative
-form, while relative links outside it become absolute without resolving symlink
-aliases. Their `SKILL.md` remains readable from every profile home and later
-alias retargeting still takes effect. Codex symlink text is unchanged.
+their skill state before launching. For Codex, `$HOME/.agents/skills` is already
+inherited. A configured source at or below that root is not copied,
+which avoids duplicate selector entries. Otherwise rtr copies the configured
+source, or the legacy `~/.codex/skills` default when it is distinct, while
+excluding source `.system` and preserving the selected profile's Codex-owned
+`.system` cache.
+
+Claude continues to replace `<profile home>/skills` from `skills_source` or
+`~/.claude/skills`. For both tools, an explicit source must exist; missing
+defaults remove stale rtr-managed user skills. Relative `skills_source` paths
+resolve from the rtr config directory. Skill folders may be symlinks: links
+within the copied tree keep their relative form, while relative links outside
+it become absolute without resolving symlink aliases. Their `SKILL.md` remains
+readable from every profile home and later alias retargeting still takes effect.
 
 The config file is `0600`. Round-robin cursors and legacy switch state live in
 `~/.local/state/rtr/state.toml`.
@@ -163,8 +180,11 @@ renders incorrectly.
 - **Proxy bind error** — another rtr process owns the configured port; stop it
   or set `[proxy] port = 0` for an ephemeral port.
 - **No eligible profiles** — run `rtr add <tool> --profile <name>`.
-- **A profile lacks preferences or skills** — native homes are isolated by
-  design; configure `skills_source` for shared skill definitions. For Claude,
+- **A Codex profile lacks personal skills** — put current user skills in
+  `$HOME/.agents/skills`; use `skills_source` only for an external root Codex
+  would not otherwise discover.
+- **A Claude profile lacks skills** — configure `skills_source` for shared skill
+  definitions. Native homes are isolated by design; for Claude,
   keep profile-specific settings, commands, agents, and plugins inside that
   profile's `CLAUDE_CONFIG_DIR`; project `.claude/*` files need no copying.
 - **Regenerating the CA** — run `rtr untrust` before deleting the CA files so an

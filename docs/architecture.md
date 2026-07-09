@@ -50,6 +50,14 @@ service. rtr sets the secure-storage namespace to the selected profile path so
 an inherited override cannot collapse profiles onto one Keychain entry; rtr
 does not access those entries itself.
 
+For Codex, the child keeps `HOME` and the working directory. Codex therefore
+discovers canonical personal skills from `$HOME/.agents/skills`, repository
+skills from `.agents/skills`, and admin skills from `/etc/codex/skills` without
+rtr copying them. The runner bridges a distinct legacy `~/.codex/skills` or
+external configured source into the selected profile, but skips an inherited
+source, excludes source `.system`, and preserves the selected home's Codex-owned
+`.system` cache. Claude keeps the generic fresh-copy path.
+
 ## Legacy run flow
 
 ```text
@@ -105,7 +113,8 @@ scope regardless of configured `hosts`.
   usage.jsonl
   homes/
     codex/<profile>/          # passed as CODEX_HOME
-      skills/                 # fresh copy from skills_source or ~/.codex/skills
+      skills/                 # distinct legacy/configured skills only
+        .system/              # installed and refreshed by Codex
     claude/<profile>/         # passed as CLAUDE_CONFIG_DIR
       skills/                 # fresh copy from skills_source or ~/.claude/skills
       .claude.json            # Claude-owned app/account state, created on use
@@ -129,5 +138,9 @@ Default launches create no per-run artifact directory. Explicit `--log` adds:
 - `tests/proxy_e2e.rs` sends a real plain-HTTP proxy request and verifies the
   upstream sees the rewritten header.
 - `tests/run_smoke.rs` verifies default artifact-free launches, opt-in tee
-  output, native-home and Claude secure-storage injection, cross-profile state
-  isolation, args, skills refresh, usage, rewrites, and exit propagation.
+  output, native-home injection, args, skills refresh, usage, rewrites, and exit
+  propagation, Claude secure-storage injection, and cross-profile state
+  isolation.
+- Codex-specific unit coverage verifies inherited-root deduplication, legacy
+  compatibility, profile config/auth isolation, `.system` ownership, rollback,
+  and usable relocated symlinks.

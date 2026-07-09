@@ -25,7 +25,7 @@ pub const CODEX: ToolSpec = ToolSpec {
     native_home_env: "CODEX_HOME",
     native_secure_storage_env: None,
     default_skills_source: &[".codex", "skills"],
-    rebase_external_skill_symlinks: false,
+    rebase_external_skill_symlinks: true,
 };
 
 pub const SPECS: &[ToolSpec] = &[CLAUDE, CODEX];
@@ -72,7 +72,7 @@ mod tests {
         assert_eq!(spec.native_home_env, "CODEX_HOME");
         assert_eq!(spec.native_secure_storage_env, None);
         assert_eq!(spec.default_skills_source, &[".codex", "skills"]);
-        assert!(!spec.rebase_external_skill_symlinks);
+        assert!(spec.rebase_external_skill_symlinks);
     }
 
     #[test]

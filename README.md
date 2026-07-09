@@ -15,8 +15,10 @@ state or changing system-wide networking.
 - **Native profile homes** — `rtr claude` and `rtr codex` set
   `CLAUDE_CONFIG_DIR` or `CODEX_HOME` under
   `~/.local/state/rtr/homes/<tool>/<profile>/`
-- **Fresh skills sync** — each run replaces only `<profile home>/skills` from
-  the tool default or configured source
+- **Native skill discovery** — Codex inherits current user/repo skill roots and
+  bridges only distinct legacy/configured roots into the selected home; Claude
+  refreshes its configured/default profile copy while keeping linked skills
+  usable after relocation
 - **Simple onboarding** — `rtr add` creates a profile and launches the tool to
   log in inside its native home
 - **Subscription profiles** — choose one profile with `--profile/-p` or use
@@ -135,7 +137,6 @@ port = 62888
 command = ["codex"]
 hosts = ["chatgpt.com"]
 selection = "round-robin"
-skills_source = "~/.skills"
 
 [tools.codex.profiles.personal]
 enabled = true
@@ -153,16 +154,17 @@ enabled = true
 | Field | Description |
 | --- | --- |
 | `command` | Program and base args to spawn; user args are appended |
-| `hosts` | Exact hosts or dot-prefixed suffixes for legacy/custom interception |
-| `selection` | `round-robin` for first-class Claude/Codex commands |
-| `skills_source` | Optional directory copied fresh to `<profile home>/skills` |
+| `hosts` | Exact hostnames or dot-prefixed suffixes for legacy/custom `rtr run` interception |
+| `selection` | `round-robin` for first-class subscription commands |
+| `skills_source` | Optional shared skill root reconciled with the selected native home before first-class runs |
 | `enabled` | Optional profile flag; absent means enabled |
 | `set` / `remove` | Legacy/custom headers to overwrite or delete |
 | `metadata` | Stored profile metadata that is never rewritten |
 
 First-class runs ignore stored header rewrites and use the selected native home
-as the identity boundary. If `skills_source` is omitted, rtr uses
-`~/.codex/skills` or `~/.claude/skills`; a missing default means no synced
+as the identity boundary. If `skills_source` is omitted, Claude uses
+`~/.claude/skills`; Codex bridges legacy `~/.codex/skills` only when it is not
+already the canonical user root. A missing default means no rtr-synced user
 skills. Relative sources resolve from the rtr config directory.
 
 ## State and logs
@@ -175,6 +177,20 @@ skills. Relative sources resolve from the rtr config directory.
     codex/<profile>/
     claude/<profile>/
 ```
+
+Current Codex discovers personal skills from `$HOME/.agents/skills`, repository
+skills from `.agents/skills`, admin skills from `/etc/codex/skills`, and bundled
+skills from the installed binary. `rtr` keeps `HOME` and the working directory,
+so those roots remain available without copying them into every profile. It
+copies the legacy `$HOME/.codex/skills` root only when that root is distinct
+from `$HOME/.agents/skills`. A configured Codex `skills_source` is also skipped
+when it is already inside the canonical user root; otherwise it is copied after
+excluding `.system`, which remains owned by Codex in the selected profile.
+
+Claude retains the existing fresh-copy behavior from `skills_source` or
+`~/.claude/skills`. Explicit sources must exist, missing defaults remove stale
+rtr-managed user skills, and relative paths resolve from the rtr config
+directory.
 
 Normal launches do not create a run directory. With `--log`, rtr creates:
 
