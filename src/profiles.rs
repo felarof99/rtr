@@ -1,5 +1,7 @@
 //! Profile inspection commands for the native launcher.
 
+use std::io::{BufRead, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -164,6 +166,89 @@ pub fn run_set_profile_enabled(paths: &Paths, target: &str, enabled: bool) -> Re
     Ok(())
 }
 
+/// Confirm and permanently remove one configured profile and its native home.
+pub fn run_remove_profile(
+    paths: &Paths,
+    tool_name: &str,
+    profile_name: &str,
+    assume_yes: bool,
+) -> Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    remove_profile_with_io(
+        paths,
+        tool_name,
+        profile_name,
+        assume_yes,
+        &mut stdin.lock(),
+        &mut stdout.lock(),
+    )?;
+    Ok(())
+}
+
+fn remove_profile_with_io<R: BufRead, W: Write>(
+    paths: &Paths,
+    tool_name: &str,
+    profile_name: &str,
+    assume_yes: bool,
+    input: &mut R,
+    output: &mut W,
+) -> Result<bool> {
+    let spec = tool_specs::get(tool_name)?;
+    let config_path = paths.config_file();
+    if !config_path.exists() {
+        bail!(
+            "no config at {} — run `rtr init` first",
+            config_path.display()
+        );
+    }
+    let config = Config::load(&config_path)?;
+    let tool = config.tool(spec.name)?;
+    if !tool.profiles.contains_key(profile_name) {
+        bail!("tool '{}' has no profile '{profile_name}'", spec.name);
+    }
+
+    let profile_home = paths.profile_home_dir(spec.name, profile_name);
+    output.write_all(b"Profile home to delete: ")?;
+    output.write_all(profile_home.as_os_str().as_bytes())?;
+    output.write_all(b"\n")?;
+    if !assume_yes {
+        write!(
+            output,
+            "Permanently delete {}/{} and its auth and sessions? [y/N] ",
+            spec.name, profile_name
+        )?;
+        output.flush()?;
+        let mut answer = String::new();
+        input.read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            writeln!(output, "Cancelled.")?;
+            return Ok(false);
+        }
+    }
+
+    crate::file_lock::with_exclusive_lock(&crate::file_lock::lock_path(&config_path), || {
+        let mut config = Config::load(&config_path)?;
+        let tool = config.tool(spec.name)?;
+        if !tool.profiles.contains_key(profile_name) {
+            bail!("tool '{}' has no profile '{profile_name}'", spec.name);
+        }
+        if !crate::config::remove_profile_entry_in_file(
+            &config_path,
+            &mut config,
+            spec.name,
+            profile_name,
+        )? {
+            bail!("tool '{}' has no profile '{profile_name}'", spec.name);
+        }
+        Ok(())
+    })?;
+
+    paths.remove_profile_home_dir(spec.name, profile_name)?;
+    writeln!(output, "Removed profile: {}/{}", spec.name, profile_name)?;
+    Ok(true)
+}
+
 /// Render tool configuration and selected profiles without loading child state.
 pub fn render_status(cfg: &Config, tool_filter: Option<&str>) -> Result<String> {
     use std::fmt::Write as _;
@@ -209,6 +294,7 @@ pub fn print_status(paths: &Paths, tool_filter: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::PathBuf;
 
     fn test_paths(root: &Path) -> Paths {
@@ -373,6 +459,19 @@ mod tests {
         );
     }
 
+    fn write_removal_fixture(paths: &Paths) {
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "# keep\n[tools.codex]\ncommand = [\"codex\"]\n\n[tools.codex.profiles.personal]\n\n[tools.codex.profiles.work]\n",
+        )
+        .unwrap();
+        for profile in ["personal", "work"] {
+            let home = paths.ensure_profile_home_dir("codex", profile).unwrap();
+            std::fs::write(home.join("auth.json"), profile).unwrap();
+        }
+    }
+
     #[test]
     fn profile_views_contain_only_native_launcher_state() {
         let cfg =
@@ -398,5 +497,110 @@ mod tests {
             assert!(!shown.contains(removed), "{shown}");
             assert!(!status.contains(removed), "{status}");
         }
+    }
+
+    #[test]
+    fn profile_removal_can_be_cancelled_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_removal_fixture(&paths);
+        let before = std::fs::read_to_string(paths.config_file()).unwrap();
+        let mut input = std::io::Cursor::new(b"n\n");
+        let mut output = Vec::new();
+
+        assert!(!remove_profile_with_io(
+            &paths,
+            "codex",
+            "personal",
+            false,
+            &mut input,
+            &mut output,
+        )
+        .unwrap());
+
+        assert_eq!(
+            std::fs::read_to_string(paths.config_file()).unwrap(),
+            before
+        );
+        assert!(paths
+            .profile_home_dir("codex", "personal")
+            .join("auth.json")
+            .is_file());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Profile home to delete:"), "{output}");
+        assert!(output.contains("Cancelled"), "{output}");
+    }
+
+    #[test]
+    fn profile_removal_prints_exact_non_utf8_home_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = test_paths(dir.path());
+        paths.state_dir = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"state-\xff".to_vec()));
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[tools.codex]\ncommand = [\"codex\"]\n[tools.codex.profiles.personal]\n",
+        )
+        .unwrap();
+        let mut input = std::io::Cursor::new(b"n\n");
+        let mut output = Vec::new();
+
+        remove_profile_with_io(&paths, "codex", "personal", false, &mut input, &mut output)
+            .unwrap();
+
+        let expected_path = paths.profile_home_dir("codex", "personal");
+        let expected = expected_path.as_os_str().as_bytes();
+        assert!(
+            output
+                .windows(expected.len())
+                .any(|window| window == expected),
+            "output did not contain exact path bytes: {output:?}"
+        );
+    }
+
+    #[test]
+    fn confirmed_profile_removal_deletes_only_the_selected_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_removal_fixture(&paths);
+        let mut input = std::io::empty();
+        let mut output = Vec::new();
+
+        assert!(
+            remove_profile_with_io(&paths, "codex", "personal", true, &mut input, &mut output,)
+                .unwrap()
+        );
+
+        let config = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(config.contains("# keep"), "{config}");
+        assert!(!config.contains("profiles.personal"), "{config}");
+        assert!(config.contains("profiles.work"), "{config}");
+        assert!(!paths.profile_home_dir("codex", "personal").exists());
+        assert!(paths
+            .profile_home_dir("codex", "work")
+            .join("auth.json")
+            .is_file());
+    }
+
+    #[test]
+    fn unknown_profile_is_rejected_before_home_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        write_removal_fixture(&paths);
+        let mut input = std::io::empty();
+        let mut output = Vec::new();
+
+        let error =
+            remove_profile_with_io(&paths, "codex", "missing", true, &mut input, &mut output)
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("no profile 'missing'"), "{error}");
+        assert!(paths
+            .profile_home_dir("codex", "personal")
+            .join("auth.json")
+            .is_file());
     }
 }

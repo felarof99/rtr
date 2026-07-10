@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod config_command;
 mod file_lock;
 pub mod paths;
 pub mod profiles;
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use cli::Cmd;
+use cli::{Cmd, ConfigCommand};
 use paths::Paths;
 
 pub fn home_dir() -> Result<PathBuf> {
@@ -61,6 +62,30 @@ pub async fn run() -> Result<()> {
         }
         Cmd::Add { tool, profile } => {
             let code = runner::add_subscription_profile(&paths, &tool, &profile).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Cmd::Rm { tool, profile, yes } => {
+            profiles::run_remove_profile(&paths, &tool, &profile, yes)
+        }
+        Cmd::Config { command } => match command {
+            None => {
+                let stdout = std::io::stdout();
+                config_command::write_config_path(&paths, &mut stdout.lock())?;
+                Ok(())
+            }
+            Some(ConfigCommand::Edit) => {
+                let code = config_command::edit_config(&paths)?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                Ok(())
+            }
+        },
+        Cmd::Fix { tool, profile } => {
+            let code = runner::fix_subscription_profile(&paths, &tool, &profile).await?;
             if code != 0 {
                 std::process::exit(code);
             }

@@ -17,12 +17,17 @@ Omit --profile to rotate through enabled profiles:
   rtr codex
   rtr codex
 
+Put -- before child args that should not be parsed by rtr:
+  rtr codex -- --profile native-codex-profile
+
 Pause a profile and bring it back later:
   rtr disable codex/personal
   rtr enable codex/personal
 
-Put -- before child args that should not be parsed by rtr:
-  rtr codex -- --profile native-codex-profile";
+Maintain profiles and config:
+  rtr fix codex --profile personal
+  rtr rm codex --profile personal
+  rtr config edit";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -68,6 +73,45 @@ passed to Codex.")]
         #[arg(long)]
         profile: String,
     },
+    /// Delete a Claude/Codex profile and its native home.
+    #[command(long_about = "\
+Delete one configured profile and its native home.
+
+This permanently deletes auth and sessions stored in that profile. rtr prints
+the exact home path and asks for confirmation unless --yes is supplied.")]
+    Rm {
+        /// Tool to remove from: claude or codex.
+        tool: String,
+        /// Profile name to delete.
+        #[arg(long)]
+        profile: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Print or edit the resolved config.toml path.
+    #[command(long_about = "\
+Print the resolved config.toml path.
+
+The default output is only the path for script-friendly use. `rtr config edit`
+opens an existing config with $VISUAL, falling back to $EDITOR.")]
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
+    /// Repair an existing profile's authentication in place.
+    #[command(long_about = "\
+Repair one existing profile and re-authenticate in place.
+
+rtr removes recognized stale credential locks from only that profile home, then
+launches the configured tool there. This leaves rotation unchanged.")]
+    Fix {
+        /// Tool to repair: claude or codex.
+        tool: String,
+        /// Existing profile name to repair.
+        #[arg(long)]
+        profile: String,
+    },
     /// Re-enable a profile for selection and rotation.
     #[command(long_about = "\
 Re-enable one profile as <tool>/<profile>.
@@ -101,6 +145,12 @@ and rejected by --profile until re-enabled. Already disabled is a success.")]
     },
     /// Show configured tools and profiles.
     Status { tool: Option<String> },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Open config.toml with $VISUAL or $EDITOR.
+    Edit,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -221,6 +271,25 @@ mod tests {
             Cmd::Add { tool, profile } if tool == "codex" && profile == "personal"
         ));
         assert!(matches!(
+            parse_from(["rm", "codex", "--profile", "personal", "--yes"]).cmd,
+            Cmd::Rm { tool, profile, yes }
+                if tool == "codex" && profile == "personal" && yes
+        ));
+        assert!(matches!(
+            parse_from(["config"]).cmd,
+            Cmd::Config { command: None }
+        ));
+        assert!(matches!(
+            parse_from(["config", "edit"]).cmd,
+            Cmd::Config {
+                command: Some(ConfigCommand::Edit)
+            }
+        ));
+        assert!(matches!(
+            parse_from(["fix", "codex", "--profile", "personal"]).cmd,
+            Cmd::Fix { tool, profile } if tool == "codex" && profile == "personal"
+        ));
+        assert!(matches!(
             parse_from(["disable", "codex/personal"]).cmd,
             Cmd::Disable { target } if target == "codex/personal"
         ));
@@ -241,13 +310,51 @@ mod tests {
             "rtr claude --profile work [claude args...]",
             "rtr codex --profile personal [codex args...]",
             "Omit --profile to rotate through enabled profiles:",
+            "rtr codex -- --profile native-codex-profile",
             "Pause a profile and bring it back later:",
             "rtr disable codex/personal",
             "rtr enable codex/personal",
-            "rtr codex -- --profile native-codex-profile",
+            "Maintain profiles and config:",
+            "rtr fix codex --profile personal",
+            "rtr rm codex --profile personal",
+            "rtr config edit",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
         }
+    }
+
+    #[test]
+    fn command_help_describes_profile_and_maintenance_behavior() {
+        let claude = help_for(&["claude"]);
+        assert!(
+            claude.contains("Configured rtr profile to use instead of automatic rotation"),
+            "{claude}"
+        );
+        assert!(
+            claude.contains("Arguments passed through to the selected tool"),
+            "{claude}"
+        );
+        assert!(claude.contains("leaves rotation unchanged"), "{claude}");
+
+        let add = help_for(&["add"]);
+        assert!(add.contains("Tool to add: claude or codex"), "{add}");
+        assert!(add.contains("Profile name to create"), "{add}");
+
+        let remove = help_for(&["rm"]);
+        assert!(
+            remove.contains("permanently deletes auth and sessions"),
+            "{remove}"
+        );
+        assert!(remove.contains("Skip the confirmation prompt"), "{remove}");
+
+        let config = help_for(&["config"]);
+        assert!(config.contains("resolved config.toml path"), "{config}");
+        assert!(config.contains("VISUAL"), "{config}");
+        assert!(config.contains("EDITOR"), "{config}");
+
+        let fix = help_for(&["fix"]);
+        assert!(fix.contains("re-authenticate in place"), "{fix}");
+        assert!(fix.contains("leaves rotation unchanged"), "{fix}");
     }
 
     #[test]
@@ -264,24 +371,6 @@ mod tests {
         assert!(enable.contains("Profile as <tool>/<profile>"), "{enable}");
         assert!(enable.contains("rejoins automatic rotation"), "{enable}");
         assert!(enable.contains("Already enabled is a success"), "{enable}");
-    }
-
-    #[test]
-    fn run_and_add_help_describe_profile_and_passthrough() {
-        let claude = help_for(&["claude"]);
-        assert!(
-            claude.contains("Configured rtr profile to use instead of automatic rotation"),
-            "{claude}"
-        );
-        assert!(
-            claude.contains("Arguments passed through to the selected tool"),
-            "{claude}"
-        );
-        assert!(claude.contains("leaves rotation unchanged"), "{claude}");
-
-        let add = help_for(&["add"]);
-        assert!(add.contains("Tool to add: claude or codex"), "{add}");
-        assert!(add.contains("Profile name to create"), "{add}");
     }
 
     #[test]

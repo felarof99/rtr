@@ -54,6 +54,12 @@ rtr codex
 rtr codex
 ```
 
+Use `--` when a child argument should not be parsed by rtr:
+
+```bash
+rtr codex -- --profile native-codex-profile
+```
+
 Pause a profile and bring it back later:
 
 ```bash
@@ -61,17 +67,26 @@ rtr disable codex/personal
 rtr enable codex/personal
 ```
 
-Use `--` when a child argument should not be parsed by rtr:
+Find or edit the active config, repair a profile in place, or remove one:
 
 ```bash
-rtr codex -- --profile native-codex-profile
+rtr config
+rtr config edit
+rtr fix codex --profile personal
+rtr rm codex --profile personal
 ```
+
+`rm` prints the exact native-home path and confirms before deleting its auth,
+settings, and sessions. Use `--yes` only when confirmation is handled elsewhere.
 
 ## Commands
 
 ```text
 rtr init [--force]
 rtr add <claude|codex> --profile <name>
+rtr rm <claude|codex> --profile <name> [--yes]
+rtr fix <claude|codex> --profile <name>
+rtr config [edit]
 rtr claude [-p|--profile <name>] [claude args...]
 rtr codex  [-p|--profile <name>] [codex args...]
 rtr enable <tool>/<profile>
@@ -84,7 +99,9 @@ rtr stats [--today]
 
 ## Configuration
 
-Default path: `~/.config/rtr/config.toml`
+Run `rtr config` to print the resolved path, or `rtr config edit` to open an
+existing config with `$VISUAL` or `$EDITOR`. The default path is
+`~/.config/rtr/config.toml`.
 
 ```toml
 [tools.claude]
@@ -101,7 +118,7 @@ command = ["codex"]
 Profiles are enabled by default. `rtr disable <tool>/<profile>` flips
 `enabled = false` in place — comments preserved, native home and sign-in kept —
 and removes the profile from explicit selection and automatic rotation until
-`rtr enable` restores it.
+`rtr enable` restores it. You can also set `enabled = false` by hand.
 
 Claude receives profile-specific `CLAUDE_CONFIG_DIR` and
 `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Codex receives profile-specific
