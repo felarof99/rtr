@@ -69,15 +69,8 @@ pub fn run_list_profiles(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// Split a `<tool>/<profile>` command target into its two parts.
-fn parse_target(target: &str) -> Result<(&str, &str)> {
-    target
-        .split_once('/')
-        .with_context(|| format!("profile target '{target}' must look like <tool>/<profile>"))
-}
-
-pub fn run_show_profile(paths: &Paths, target: &str) -> Result<()> {
-    let (tool_name, profile_name) = parse_target(target)?;
+/// Print one configured profile and its resolved native home.
+pub fn run_show_profile(paths: &Paths, tool_name: &str, profile_name: &str) -> Result<()> {
     let spec = tool_specs::get(tool_name)?;
     let cfg = Config::load(&paths.config_file())?;
     let profile = cfg
@@ -108,8 +101,12 @@ pub struct ToggleReport {
 }
 
 /// Flip one profile's enabled flag under the config lock; idempotent by design.
-pub fn set_profile_enabled(paths: &Paths, target: &str, enabled: bool) -> Result<ToggleReport> {
-    let (tool_name, profile_name) = parse_target(target)?;
+pub fn set_profile_enabled(
+    paths: &Paths,
+    tool_name: &str,
+    profile_name: &str,
+    enabled: bool,
+) -> Result<ToggleReport> {
     let spec = tool_specs::get(tool_name)?;
     let config_path = paths.config_file();
     if !config_path.exists() {
@@ -148,6 +145,12 @@ pub fn set_profile_enabled(paths: &Paths, target: &str, enabled: bool) -> Result
 
 pub fn render_toggle_report(report: &ToggleReport) -> String {
     let target = format!("{}/{}", report.tool, report.profile);
+    let quoted_profile = crate::runner::shell_quote(&report.profile);
+    let profile_argument = if report.profile.starts_with('-') {
+        format!("--profile={quoted_profile}")
+    } else {
+        format!("--profile {quoted_profile}")
+    };
     let state = if report.enabled {
         "enabled"
     } else {
@@ -157,8 +160,8 @@ pub fn render_toggle_report(report: &ToggleReport) -> String {
         (false, _) => format!("{target} is already {state}\n"),
         (true, true) => format!("Enabled {target}\n"),
         (true, false) => format!(
-            "Disabled {target} (re-enable with: rtr enable {})\n",
-            crate::runner::shell_quote(&target)
+            "Disabled {target} (re-enable with: rtr enable {} {profile_argument})\n",
+            report.tool
         ),
     };
     if !report.enabled && report.tool_enabled_remaining == 0 {
@@ -170,8 +173,14 @@ pub fn render_toggle_report(report: &ToggleReport) -> String {
     out
 }
 
-pub fn run_set_profile_enabled(paths: &Paths, target: &str, enabled: bool) -> Result<()> {
-    let report = set_profile_enabled(paths, target, enabled)?;
+/// Update one profile's enabled state and print the resulting status.
+pub fn run_set_profile_enabled(
+    paths: &Paths,
+    tool_name: &str,
+    profile_name: &str,
+    enabled: bool,
+) -> Result<()> {
+    let report = set_profile_enabled(paths, tool_name, profile_name, enabled)?;
     print!("{}", render_toggle_report(&report));
     Ok(())
 }
@@ -414,19 +423,6 @@ mod tests {
     }
 
     #[test]
-    fn target_parsing_requires_tool_slash_profile() {
-        assert_eq!(
-            parse_target("codex/work team").unwrap(),
-            ("codex", "work team")
-        );
-        let err = parse_target("codex").unwrap_err().to_string();
-        assert!(
-            err.contains("profile target 'codex' must look like <tool>/<profile>"),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn toggle_changes_state_once_and_is_idempotent_without_rewriting() {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
@@ -435,14 +431,14 @@ mod tests {
             "# mine\n[tools.codex]\ncommand = [\"codex\"]\n[tools.codex.profiles.a]\n[tools.codex.profiles.b]\n",
         );
 
-        let disabled = set_profile_enabled(&paths, "codex/a", false).unwrap();
+        let disabled = set_profile_enabled(&paths, "codex", "a", false).unwrap();
         assert!(disabled.changed);
         assert_eq!(disabled.tool_enabled_remaining, 1);
         let after_change = std::fs::read_to_string(&path).unwrap();
         assert!(after_change.contains("# mine"), "{after_change}");
 
         let changed_meta = std::fs::metadata(&path).unwrap();
-        let repeat = set_profile_enabled(&paths, "codex/a", false).unwrap();
+        let repeat = set_profile_enabled(&paths, "codex", "a", false).unwrap();
         assert!(!repeat.changed);
         assert_eq!(repeat.tool_enabled_remaining, 1);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), after_change);
@@ -451,27 +447,26 @@ mod tests {
             changed_meta.modified().unwrap()
         );
 
-        let enabled = set_profile_enabled(&paths, "codex/a", true).unwrap();
+        let enabled = set_profile_enabled(&paths, "codex", "a", true).unwrap();
         assert!(enabled.changed);
         assert_eq!(enabled.tool_enabled_remaining, 2);
     }
 
     #[test]
-    fn toggle_rejects_unknown_targets_before_writing() {
+    fn toggle_rejects_unknown_tool_or_profile_before_writing() {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
         let original = "[tools.codex]\ncommand = [\"codex\"]\n[tools.codex.profiles.a]\n";
         let path = write_config(&paths, original);
 
-        for (target, expected) in [
-            ("codex", "must look like <tool>/<profile>"),
-            ("curl/a", "unsupported subscription tool 'curl'"),
-            ("codex/ghost", "tool 'codex' has no profile 'ghost'"),
+        for (tool, profile, expected) in [
+            ("curl", "a", "unsupported subscription tool 'curl'"),
+            ("codex", "ghost", "tool 'codex' has no profile 'ghost'"),
         ] {
-            let err = set_profile_enabled(&paths, target, false)
+            let err = set_profile_enabled(&paths, tool, profile, false)
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains(expected), "target {target}: {err}");
+            assert!(err.contains(expected), "{tool}/{profile}: {err}");
         }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
@@ -481,7 +476,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = test_paths(temp.path());
 
-        let err = set_profile_enabled(&paths, "codex/a", false)
+        let err = set_profile_enabled(&paths, "codex", "a", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("rtr init"), "{err}");
@@ -498,14 +493,14 @@ mod tests {
         );
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        let handles: Vec<_> = ["codex/a", "codex/b"]
+        let handles: Vec<_> = [("codex", "a"), ("codex", "b")]
             .into_iter()
-            .map(|target| {
+            .map(|(tool, profile)| {
                 let barrier = std::sync::Arc::clone(&barrier);
                 let paths = paths.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    set_profile_enabled(&paths, target, false)
+                    set_profile_enabled(&paths, tool, profile, false)
                 })
             })
             .collect();
@@ -648,11 +643,11 @@ mod tests {
         };
         assert_eq!(
             render_toggle_report(&report(false, true, 1)),
-            "Disabled codex/personal (re-enable with: rtr enable codex/personal)\n"
+            "Disabled codex/personal (re-enable with: rtr enable codex --profile personal)\n"
         );
         assert_eq!(
             render_toggle_report(&report(false, true, 0)),
-            "Disabled codex/personal (re-enable with: rtr enable codex/personal)\nnote: tool 'codex' has no enabled profiles\n"
+            "Disabled codex/personal (re-enable with: rtr enable codex --profile personal)\nnote: tool 'codex' has no enabled profiles\n"
         );
         assert_eq!(
             render_toggle_report(&report(true, true, 2)),
@@ -676,7 +671,19 @@ mod tests {
         });
         assert_eq!(
             quoted,
-            "Disabled codex/work team (re-enable with: rtr enable 'codex/work team')\n"
+            "Disabled codex/work team (re-enable with: rtr enable codex --profile 'work team')\n"
+        );
+
+        let leading_hyphen = render_toggle_report(&ToggleReport {
+            tool: "codex".to_string(),
+            profile: "-work".to_string(),
+            enabled: false,
+            changed: true,
+            tool_enabled_remaining: 1,
+        });
+        assert_eq!(
+            leading_hyphen,
+            "Disabled codex/-work (re-enable with: rtr enable codex --profile=-work)\n"
         );
     }
 
