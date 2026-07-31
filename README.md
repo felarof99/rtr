@@ -10,7 +10,7 @@ settings, sessions, and skills without logging in and out.
 
 ## How it works
 
-<img src="assets/rtr-flow.svg" alt="Launch flow. Two commands enter a selector: 'rtr codex -p personal' pins a profile and leaves the cursor unchanged, while a bare 'rtr codex' takes the next enabled profile in name order and advances the cursor. The selector feeds three isolated native homes — codex/oss, codex/personal, codex/work — each with its own CODEX_HOME. The selected lane, codex/personal, continues into 'exec codex', a direct child that inherits the terminal. The native home is created and its skills refreshed under an exclusive lock before the cursor advances. Claude profiles receive CLAUDE_CONFIG_DIR and CLAUDE_SECURESTORAGE_CONFIG_DIR instead of CODEX_HOME.">
+<img src="assets/rtr-flow.svg" alt="Launch flow. Two commands enter a selector: 'rtr codex -p personal' pins a profile and leaves the cursor unchanged, while a bare 'rtr codex' takes the next enabled profile in name order and advances the cursor. The selector feeds three isolated native homes — codex/oss, codex/personal, codex/work — each with its own CODEX_HOME. The selected lane, codex/personal, continues into 'exec codex', a direct child that inherits the terminal. The native home is created and its startup files synchronized under an exclusive lock before the cursor advances. Claude profiles receive CLAUDE_CONFIG_DIR and CLAUDE_SECURESTORAGE_CONFIG_DIR instead of CODEX_HOME.">
 
 `--profile` pins a profile and leaves the rotation cursor unchanged; without it,
 rtr takes the next enabled profile in name order. Either way the profile's native
@@ -142,6 +142,10 @@ existing config with `$VISUAL` or `$EDITOR`. The default path is
 ```toml
 [tools.claude]
 command = ["claude"]
+copy = [
+  { source = "~/.skills", destination = "skills" },
+  { source = "shared/CLAUDE.md", destination = "CLAUDE.md" },
+]
 
 [tools.claude.profiles.work]
 
@@ -150,6 +154,13 @@ command = ["codex"]
 
 [tools.codex.profiles.personal]
 ```
+
+`copy` belongs to the tool, so every non-bypassed isolated launch refreshes the
+listed files or directories in whichever profile was selected. Sources use the
+user home for `~/...` and the rtr config directory for relative paths.
+Destinations use the selected profile home for both relative paths and `~/...`.
+Omit `copy` to retain the built-in skills refresh (and optional legacy
+`skills_source` override), or set `copy = []` to disable startup copying.
 
 Profiles are enabled by default. `rtr disable <tool> --profile <name>` flips
 `enabled = false` in place — comments preserved, native home and sign-in kept —
@@ -160,8 +171,8 @@ and removes the profile from explicit selection and automatic rotation until
 `rtr bypass <tool> --profile <name>` persists `bypass = true` and keeps
 selecting the profile normally, but launches the real CLI with no native-home
 override so it uses the default Claude or Codex home. rtr does not create the
-isolated home or sync skills during bypassed runs. `rtr unbypass` restores
-isolated launches.
+isolated home or run startup synchronization during bypassed launches.
+`rtr unbypass` restores isolated launches.
 
 Claude receives profile-specific `CLAUDE_CONFIG_DIR` and
 `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Codex receives profile-specific
@@ -178,8 +189,8 @@ default home instead.
 `rtr paths --json` emits the stable machine contract. Version 1 has a top-level
 `version` and `profiles`; each profile has `tool`, `profile`, `home_env`, `home`,
 `enabled`, `bypass`, and `exists`. The command only resolves and checks paths:
-it does not create homes, synchronize skills, or inspect credentials or
-sessions.
+it does not create homes, run startup synchronization, or inspect credentials
+or sessions.
 
 ## Files
 
@@ -194,8 +205,8 @@ Set `RTR_CONFIG_DIR` and `RTR_STATE_DIR` to override the two base directories.
 
 ## More Detail
 
-See [docs/usage.md](docs/usage.md) for config fields, skill syncing, profile
-selection rules, errors, and environment details.
+See [docs/usage.md](docs/usage.md) for config fields, startup synchronization,
+profile selection rules, errors, and environment details.
 
 ## Development
 

@@ -41,10 +41,10 @@ rtr fix codex --profile personal
 ```
 
 `fix` validates the existing profile, removes only recognized stale credential
-locks in that profile home, refreshes its skills, and launches the configured
-tool there. It preserves auth data, settings, sessions, other profile homes,
-and the automatic rotation cursor. Repair also works while a profile is
-disabled. If the profile is bypassed, `fix` reports that fact but still repairs
+locks in that profile home, runs startup synchronization, and launches the
+configured tool there. It preserves auth data, settings, sessions, other
+profile homes, and the automatic rotation cursor. Repair also works while a
+profile is disabled. If the profile is bypassed, `fix` reports that fact but still repairs
 and launches its isolated native home; normal launches remain bypassed.
 
 Delete a profile and all tool-owned state in its native home with:
@@ -78,7 +78,10 @@ path is `~/.config/rtr/config.toml`.
 ```toml
 [tools.claude]
 command = ["claude"]
-skills_source = "~/.claude/skills"
+copy = [
+  { source = "~/.skills", destination = "skills" },
+  { source = "shared/CLAUDE.md", destination = "CLAUDE.md" },
+]
 
 [tools.claude.profiles.work]
 
@@ -98,13 +101,17 @@ bypass = true
 | Field | Meaning |
 |---|---|
 | `command` | Executable and immutable leading arguments |
-| `skills_source` | Optional source copied into every selected native home |
+| `copy` | Optional tool-level list of `{ source, destination }` startup mappings; `[]` disables startup copying |
+| `skills_source` | Backwards-compatible skills source used only when `copy` is omitted |
 | `profiles.<name>.enabled` | Whether selection may use the profile; managed by `rtr enable <tool> --profile <name>` / `rtr disable <tool> --profile <name>` |
 | `profiles.<name>.bypass` | Whether runs use the tool's default home instead of the isolated native home; managed by `rtr bypass <tool> --profile <name>` / `rtr unbypass <tool> --profile <name>` |
 
-Relative `skills_source` paths resolve from the rtr config directory. `~` and
-`~/...` resolve from the user's home. Configuration is strict: unsupported
-fields are rejected instead of ignored.
+For `copy` sources, relative paths resolve from the rtr config directory and
+`~` / `~/...` resolve from the user's home. Destinations must stay inside the
+selected isolated profile home: relative paths and `~/...` both resolve from
+that profile home, while absolute paths and `..` are rejected. A tool cannot
+set both `copy` and `skills_source`. Configuration is strict: unsupported fields
+are rejected instead of ignored.
 
 ## Launch a Profile Again
 
@@ -230,16 +237,46 @@ enabled again.
 
 On a bypassed run, rtr removes inherited `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, and
 `CLAUDE_SECURESTORAGE_CONFIG_DIR` values owned by the selected tool. It does not
-create the isolated profile home or sync skills into either the isolated or
-default home. The real CLI then owns its normal behavior in `~/.codex` or
-`~/.claude`. Every bypassed launch prints a stderr banner with the profile,
-effect, and `rtr unbypass` command; `ls`, `show`, and `status` also mark it.
+create the isolated profile home or run startup synchronization in either the
+isolated or default home. The real CLI then owns its normal behavior in
+`~/.codex` or `~/.claude`. Every bypassed launch prints a stderr banner with the
+profile, effect, and `rtr unbypass` command; `ls`, `show`, and `status` also
+mark it.
 
 Both commands are idempotent and use the same locked, comment-preserving config
 edit path as enable and disable. `rtr fix` intentionally ignores bypass because
 it repairs the isolated home, and tells you when bypass remains enabled.
 
-## Skills
+## Startup synchronization
+
+Configure any number of file or directory mappings at the tool level:
+
+```toml
+[tools.codex]
+command = ["codex"]
+copy = [
+  { source = "~/.skills", destination = "skills" },
+  { source = "shared/AGENTS.md", destination = "AGENTS.md" },
+]
+```
+
+Each non-bypassed isolated launch applies the same mappings to the selected
+Codex or Claude profile home before starting the child. A source directory's
+contents replace the destination directory; a source file or symlink replaces
+the destination path. Existing destination entries not present in a source
+directory are removed. Relative source paths use `RTR_CONFIG_DIR`; relative
+destinations use the selected profile home. `~/...` means the real user home on
+the source side and the isolated profile home on the destination side.
+
+rtr rejects missing or unsupported sources, destinations outside the profile
+home, and overlapping sources or destinations before it copies anything or
+launches the child. It stages every mapping first, then atomically replaces each
+destination under one per-profile lock. A staging failure leaves all existing
+destinations unchanged; an install failure rolls the whole mapping set back.
+Bypassed launches skip synchronization entirely.
+
+Set `copy = []` to opt out. When `copy` is omitted, rtr retains its original
+skills-only behavior for existing configs:
 
 Each isolated launch refreshes `<native-home>/skills` from the tool's source.
 Bypassed launches skip this refresh.
@@ -251,7 +288,7 @@ Defaults:
 | Claude | `~/.claude/skills` | `$CLAUDE_CONFIG_DIR/skills` |
 | Codex | `~/.codex/skills` | `$CODEX_HOME/skills` |
 
-Override a source per tool:
+Override the legacy skills source per tool:
 
 ```toml
 [tools.codex]
@@ -261,7 +298,7 @@ skills_source = "~/shared/codex-skills"
 
 Relative paths resolve from `RTR_CONFIG_DIR`. The refresh is locked and uses a
 temporary sibling directory, so concurrent launches cannot expose a partial
-skills tree.
+skills tree. `skills_source` and `copy` cannot be configured together.
 
 Codex keeps the real `HOME`, so `$HOME/.agents/skills`, repository
 `.agents/skills`, and admin roots remain natively discoverable. rtr skips a
@@ -331,10 +368,10 @@ isolated home does not exist yet. `home` always names the isolated historical
 data location. When `bypass` is true, current launches use the tool's default
 home instead, while older usage may remain in the reported isolated home.
 
-Discovery is read-only: it does not create a missing home, synchronize skills,
-or inspect credentials, commands, sessions, or their contents. The JSON v1
-field names are the compatibility contract; consumers should reject versions
-they do not understand rather than fall back to parsing human output.
+Discovery is read-only: it does not create a missing home, run startup
+synchronization, or inspect credentials, commands, sessions, or their contents.
+The JSON v1 field names are the compatibility contract; consumers should reject
+versions they do not understand rather than fall back to parsing human output.
 
 ## Environment Overrides
 
