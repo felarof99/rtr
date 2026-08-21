@@ -168,6 +168,7 @@ existing config with `$VISUAL` or `$EDITOR`. The default path is
 ```toml
 [tools.claude]
 command = ["claude"]
+args = ["--effort", "max", "--model", "claude-opus-5"]
 copy = [
   { source = "~/.skills", destination = "skills" },
   { source = "shared/CLAUDE.md", destination = "CLAUDE.md" },
@@ -177,6 +178,7 @@ copy = [
 
 [tools.codex]
 command = ["codex"]
+args = ["-m", "gpt-5.6-sol", "-c", "model_reasoning_effort=max"]
 
 [tools.codex.profiles.personal]
 ```
@@ -187,6 +189,10 @@ user home for `~/...` and the rtr config directory for relative paths.
 Destinations use the selected profile home for both relative paths and `~/...`.
 Omit `copy` to retain the built-in skills refresh (and optional legacy
 `skills_source` override), or set `copy = []` to disable startup copying.
+
+`args` supplies native CLI defaults to normal launches, resumes, and forks.
+Explicit arguments replace matching `--model` / `--effort` defaults and matching
+Codex `-c` keys; repeated dangerous-permission flags collapse to one.
 
 Profiles are enabled by default. `rtr disable <tool> --profile <name>` flips
 `enabled = false` in place — comments preserved, native home and sign-in kept —

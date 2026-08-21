@@ -73,8 +73,10 @@ deletes only the safe path returned for that profile.
 ## Process Contract
 
 The configured command owns the executable and immutable leading arguments.
-Runtime arguments are appended exactly once. The runner adds the tool-specific
-identity variables:
+Tool-level `args` are native defaults: runtime model/effort/config options
+replace the corresponding defaults, while unrelated values remain. Keeping
+this mergeable layer separate prevents RTR from interpreting wrapper arguments
+inside `command`. The runner also adds the tool-specific identity variables:
 
 | Tool | Variable |
 |---|---|

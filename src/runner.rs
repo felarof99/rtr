@@ -1,5 +1,6 @@
 //! Direct child execution with isolated native homes and synchronized skills.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -153,7 +154,7 @@ fn prepare_subscription_run(
     };
     Ok(PreparedSubscriptionRun {
         profile_name: profile_name.to_string(),
-        child_args: runtime_args.to_vec(),
+        child_args: merge_tool_args(spec.name, &tool.args, runtime_args),
         child_env,
         child_env_remove,
         child_cwd: None,
@@ -1020,7 +1021,7 @@ pub async fn run_isolated_profile_tool(
     };
     let prepared = PreparedSubscriptionRun {
         profile_name: profile_name.to_string(),
-        child_args: runtime_args.to_vec(),
+        child_args: merge_tool_args(spec.name, &tool.args, runtime_args),
         child_env: prepare_native_profile_env(paths, spec, &tool, profile_name)?,
         child_env_remove: Vec::new(),
         child_cwd,
@@ -1163,7 +1164,7 @@ pub async fn fix_subscription_profile(
 
     let prepared = PreparedSubscriptionRun {
         profile_name: profile_name.to_string(),
-        child_args: Vec::new(),
+        child_args: merge_tool_args(spec.name, &tool.args, &[]),
         child_env: prepare_native_profile_env(paths, spec, &tool, profile_name)?,
         child_env_remove: Vec::new(),
         child_cwd: None,
@@ -1347,6 +1348,98 @@ fn build_tool_command(
     command.process_group(0);
     command.kill_on_drop(true);
     command
+}
+
+/// Merge native CLI defaults with one invocation while leaving wrapper
+/// arguments in `Tool::command` untouched.
+///
+/// Claude and Codex reject repeated scalar/boolean options. Runtime options
+/// therefore replace configured defaults by native option identity; Codex
+/// `-c` entries replace only the same configuration key, preserving unrelated
+/// defaults. Unknown options are passed through unchanged so RTR never guesses
+/// their arity or precedence.
+fn merge_tool_args(tool: &str, defaults: &[String], runtime: &[String]) -> Vec<String> {
+    let runtime_keys = native_arg_keys(tool, runtime);
+    let mut merged = Vec::with_capacity(defaults.len() + runtime.len());
+    let mut index = 0;
+    while index < defaults.len() {
+        if let Some((key, consumed)) = native_arg_key(tool, defaults, index) {
+            if !runtime_keys.contains(&key) {
+                merged.extend_from_slice(&defaults[index..index + consumed]);
+            }
+            index += consumed;
+        } else {
+            merged.push(defaults[index].clone());
+            index += 1;
+        }
+    }
+    merged.extend_from_slice(runtime);
+    merged
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum NativeArgKey {
+    Flag(&'static str),
+    Scalar(&'static str),
+    CodexConfig(String),
+}
+
+fn native_arg_keys(tool: &str, args: &[String]) -> HashSet<NativeArgKey> {
+    let mut keys = HashSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        if let Some((key, consumed)) = native_arg_key(tool, args, index) {
+            keys.insert(key);
+            index += consumed;
+        } else {
+            index += 1;
+        }
+    }
+    keys
+}
+
+fn native_arg_key(tool: &str, args: &[String], index: usize) -> Option<(NativeArgKey, usize)> {
+    let argument = args.get(index)?.as_str();
+    match (tool, argument) {
+        ("claude", "--dangerously-skip-permissions") => {
+            Some((NativeArgKey::Flag("dangerously-skip-permissions"), 1))
+        }
+        ("claude", "--model") => Some((
+            NativeArgKey::Scalar("model"),
+            usize::from(args.get(index + 1).is_some()) + 1,
+        )),
+        ("claude", "--effort") => Some((
+            NativeArgKey::Scalar("effort"),
+            usize::from(args.get(index + 1).is_some()) + 1,
+        )),
+        ("codex", "--dangerously-bypass-approvals-and-sandbox") => Some((
+            NativeArgKey::Flag("dangerously-bypass-approvals-and-sandbox"),
+            1,
+        )),
+        ("codex", "-m" | "--model") => Some((
+            NativeArgKey::Scalar("model"),
+            usize::from(args.get(index + 1).is_some()) + 1,
+        )),
+        ("codex", "-c" | "--config") => {
+            let value = args.get(index + 1)?;
+            let key = value.split_once('=')?.0;
+            (!key.is_empty()).then(|| (NativeArgKey::CodexConfig(key.to_string()), 2))
+        }
+        ("claude", value) if value.starts_with("--model=") => {
+            Some((NativeArgKey::Scalar("model"), 1))
+        }
+        ("claude", value) if value.starts_with("--effort=") => {
+            Some((NativeArgKey::Scalar("effort"), 1))
+        }
+        ("codex", value) if value.starts_with("--model=") => {
+            Some((NativeArgKey::Scalar("model"), 1))
+        }
+        ("codex", value) if value.starts_with("--config=") => {
+            let key = value.strip_prefix("--config=")?.split_once('=')?.0;
+            (!key.is_empty()).then(|| (NativeArgKey::CodexConfig(key.to_string()), 1))
+        }
+        _ => None,
+    }
 }
 
 /// Forward a signal received by rtr to the child's process group.
@@ -1557,6 +1650,54 @@ mod tests {
             .get_envs()
             .any(|(key, value)| key == std::ffi::OsStr::new("CODEX_HOME") && value.is_none());
         assert!(removed);
+    }
+
+    #[test]
+    fn runtime_native_options_replace_matching_defaults() {
+        let defaults = vec![
+            "--dangerously-bypass-approvals-and-sandbox".into(),
+            "-m".into(),
+            "gpt-default".into(),
+            "-c".into(),
+            "model_reasoning_effort=max".into(),
+            "-c".into(),
+            "web_search=true".into(),
+        ];
+        let runtime = vec![
+            "--dangerously-bypass-approvals-and-sandbox".into(),
+            "--model=gpt-override".into(),
+            "--config=model_reasoning_effort=high".into(),
+        ];
+
+        assert_eq!(
+            merge_tool_args("codex", &defaults, &runtime),
+            [
+                "-c",
+                "web_search=true",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--model=gpt-override",
+                "--config=model_reasoning_effort=high",
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_runtime_model_and_effort_replace_defaults() {
+        let defaults = vec![
+            "--dangerously-skip-permissions".into(),
+            "--model".into(),
+            "claude-opus-5".into(),
+            "--effort".into(),
+            "max".into(),
+        ];
+        let runtime = vec![
+            "--dangerously-skip-permissions".into(),
+            "--model".into(),
+            "claude-fable-5".into(),
+            "--effort=xhigh".into(),
+        ];
+
+        assert_eq!(merge_tool_args("claude", &defaults, &runtime), runtime);
     }
 
     #[test]

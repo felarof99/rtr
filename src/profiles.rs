@@ -367,6 +367,9 @@ pub fn render_status(paths: &Paths, cfg: &Config, tool_filter: Option<&str>) -> 
         }
         let _ = writeln!(out, "  {name}");
         let _ = writeln!(out, "    command:  {}", tool.command.join(" "));
+        if !tool.args.is_empty() {
+            let _ = writeln!(out, "    args:     {}", tool.args.join(" "));
+        }
         if tool.profiles.is_empty() {
             let _ = writeln!(out, "    profiles: (none)");
             continue;

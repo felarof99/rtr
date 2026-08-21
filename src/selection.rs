@@ -46,6 +46,7 @@ mod tests {
     fn tool_with_profiles(names: &[&str]) -> Tool {
         Tool {
             command: vec!["cmd".to_string()],
+            args: Vec::new(),
             skills_source: None,
             copy: None,
             profiles: names

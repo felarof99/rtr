@@ -19,6 +19,12 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct Tool {
     pub command: Vec<String>,
+    /// Native CLI defaults merged ahead of per-invocation arguments.
+    ///
+    /// Keeping these separate from `command` preserves wrapper executables and
+    /// lets an explicit runtime option replace its configured default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills_source: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -391,6 +397,28 @@ skills_source = "~/.skills"
         assert_eq!(
             cfg.tool("codex").unwrap().skills_source.as_deref(),
             Some(Path::new("~/.skills"))
+        );
+    }
+
+    #[test]
+    fn tool_default_args_parse_and_round_trip() {
+        let cfg = Config::parse(
+            r#"
+[tools.codex]
+command = ["codex"]
+args = ["-m", "gpt-default", "-c", "model_reasoning_effort=max"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.tool("codex").unwrap().args,
+            ["-m", "gpt-default", "-c", "model_reasoning_effort=max"]
+        );
+        let round_tripped = Config::parse(&cfg.to_toml().unwrap()).unwrap();
+        assert_eq!(
+            round_tripped.tool("codex").unwrap().args,
+            cfg.tool("codex").unwrap().args
         );
     }
 

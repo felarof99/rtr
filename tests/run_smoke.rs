@@ -173,6 +173,52 @@ skills_source = {}
 }
 
 #[tokio::test]
+async fn runtime_arguments_override_tool_defaults_without_native_flag_duplicates() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let marker = temp.path().join("merged-args.txt");
+    write_config(
+        &paths,
+        &format!(
+            r#"
+[tools.codex]
+command = ["sh", "-c", "printf '%s\n' \"$@\" > {}", "runner"]
+args = [
+  "--dangerously-bypass-approvals-and-sandbox",
+  "-m", "gpt-default",
+  "-c", "model_reasoning_effort=max",
+  "-c", "web_search=true",
+]
+
+[tools.codex.profiles.personal]
+"#,
+            marker.display()
+        ),
+    );
+
+    let code = runner::run_subscription_tool(
+        &paths,
+        "codex",
+        Some("personal"),
+        &[
+            "--dangerously-bypass-approvals-and-sandbox".into(),
+            "-m".into(),
+            "gpt-override".into(),
+            "-c".into(),
+            "model_reasoning_effort=high".into(),
+        ],
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(code, 0);
+    assert_eq!(
+        std::fs::read_to_string(marker).unwrap(),
+        "-c\nweb_search=true\n--dangerously-bypass-approvals-and-sandbox\n-m\ngpt-override\n-c\nmodel_reasoning_effort=high\n"
+    );
+}
+
+#[tokio::test]
 async fn exact_conversation_launch_uses_its_isolated_profile_even_when_disabled_and_bypassed() {
     let temp = tempfile::tempdir().unwrap();
     let paths = test_paths(temp.path());
@@ -306,6 +352,7 @@ fn direct_and_fzf_open_paths_use_native_fork_and_resume_dialects() {
             r#"
 [tools.codex]
 command = ["sh", "-c", {}, "runner", {}, "base"]
+args = ["--dangerously-bypass-approvals-and-sandbox", "-m", "gpt-default"]
 skills_source = {}
 [tools.codex.profiles.archived]
 enabled = false
@@ -343,7 +390,7 @@ bypass = true
     assert!(direct.status.success(), "{direct:?}");
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap(),
-        "base\nfork\nopen-session-id\n--model\ngpt-test\n"
+        "base\n--dangerously-bypass-approvals-and-sandbox\nfork\nopen-session-id\n--model\ngpt-test\n"
     );
 
     // The fake speaks only fzf's stdin/stdout selection protocol. This tests
@@ -370,7 +417,7 @@ bypass = true
     assert!(picked.status.success(), "{picked:?}");
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap(),
-        "base\nresume\nopen-session-id\n"
+        "base\n--dangerously-bypass-approvals-and-sandbox\n-m\ngpt-default\nresume\nopen-session-id\n"
     );
 
     // Picker keys have one stable meaning regardless of which command opened
@@ -389,7 +436,7 @@ bypass = true
     );
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap(),
-        "base\nfork\nopen-session-id\n"
+        "base\n--dangerously-bypass-approvals-and-sandbox\n-m\ngpt-default\nfork\nopen-session-id\n"
     );
 }
 

@@ -78,6 +78,7 @@ path is `~/.config/rtr/config.toml`.
 ```toml
 [tools.claude]
 command = ["claude"]
+args = ["--effort", "max", "--model", "claude-opus-5"]
 copy = [
   { source = "~/.skills", destination = "skills" },
   { source = "shared/CLAUDE.md", destination = "CLAUDE.md" },
@@ -90,6 +91,7 @@ enabled = false
 
 [tools.codex]
 command = ["codex"]
+args = ["-m", "gpt-5.6-sol", "-c", "model_reasoning_effort=max"]
 skills_source = "shared/codex-skills"
 
 [tools.codex.profiles.work]
@@ -101,6 +103,7 @@ bypass = true
 | Field | Meaning |
 |---|---|
 | `command` | Executable and immutable leading arguments |
+| `args` | Native defaults for every launch; explicit runtime model/effort/config options override matching defaults |
 | `copy` | Optional tool-level list of `{ source, destination }` startup mappings; `[]` disables startup copying |
 | `skills_source` | Backwards-compatible skills source used only when `copy` is omitted |
 | `profiles.<name>.enabled` | Whether selection may use the profile; managed by `rtr enable <tool> --profile <name>` / `rtr disable <tool> --profile <name>` |
@@ -135,6 +138,10 @@ Pass tool arguments after the rtr arguments:
 rtr claude -p work --model claude-opus-4-6
 rtr codex -p personal -m gpt-5.5 -c model_reasoning_effort=xhigh
 ```
+
+When the same option is present in tool-level `args`, the explicit invocation
+wins. Codex `-c` entries merge by configuration key, so overriding
+`model_reasoning_effort` does not discard an unrelated configured `-c` value.
 
 Use `--` to force the rest of the command line to the child:
 
