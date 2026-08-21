@@ -194,12 +194,17 @@ rtr sessions --tool codex --profile personal
 rtr sessions --here --query "release"
 ```
 
-The searchable row contains the native title, first prompt, working directory,
-tool, profile, update time, and native session ID. The title is presentation;
-selection uses an opaque `(tool, profile, native ID)` key. `Enter` forks,
-`Ctrl-R` resumes, `Ctrl-F` forks explicitly, and `Esc` leaves without launching.
-The preview reads at most the tail of the selected transcript, so moving through
-large Codex rollouts never streams the full corpus.
+The interactive picker searches every user/assistant message in each native
+transcript as well as its title, first prompt, working directory, tool, profile,
+update time, and native session ID. Tool payloads, reasoning records, and
+system/developer instructions are excluded from the dialogue index. The title
+is presentation; selection uses an opaque `(tool, profile, native ID)` key.
+
+`Enter` forks, `Ctrl-R` resumes, `Ctrl-F` forks explicitly, and `Esc` leaves
+without launching. The transcript preview appears on the right when space
+allows and moves below the list on narrow terminals. `Ctrl-U` / `Ctrl-D` scroll
+it and `Alt-P` toggles it. Preview reads only a bounded tail of the selected
+transcript even though search indexes the complete human dialogue.
 
 Use the non-interactive forms for scripts and direct links:
 
@@ -242,6 +247,10 @@ subagent logs), Claude native `ai-title` / `agent-name` records, active and
 archived Codex rollout metadata, `history.jsonl`, and `session_index.jsonl`. It
 does not depend on `usage.jsonl`. Malformed or incomplete sessions are isolated
 as diagnostics so one damaged transcript cannot hide other profiles.
+
+Catalog discovery remains bounded for Codex. Full transcript bodies are scanned
+only after RTR needs the interactive picker; `--list`, `--json`, and an exact ID
+or native-name open do not pay the full-text indexing cost.
 
 Rename the active conversation with the native `/rename` command in Claude Code
 or Codex. The next catalog scan reflects that native name; RTR deliberately has

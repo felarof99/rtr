@@ -109,10 +109,12 @@ Search every native conversation across all configured profiles:
 rtr sessions
 ```
 
-The picker searches native names, first prompts, working directories, tools,
-profiles, and IDs. `Enter` forks the selected conversation, `Ctrl-R` resumes it
-in place, and `Ctrl-F` explicitly forks it. Transcript preview reads only a
-bounded tail of the selected session.
+The picker searches the complete user/assistant dialogue plus native names,
+first prompts, working directories, tools, profiles, and IDs. `Enter` forks the
+selected conversation, `Ctrl-R` resumes it in place, and `Ctrl-F` explicitly
+forks it. A right-side transcript preview moves below the list on narrow
+terminals; `Ctrl-U` / `Ctrl-D` scroll it and `Alt-P` toggles it. Preview remains
+a bounded tail of the selected session so moving through results stays fast.
 
 Open an exact native ID or exact native name directly:
 

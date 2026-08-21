@@ -7,7 +7,7 @@
 | `cli` | First-class launch, conversation, profile maintenance, and config command parsing |
 | `config` | Strict TOML schema plus lossless, atomic profile table edits |
 | `config_command` | Script-friendly config path output and editor launching |
-| `conversations` | Cross-profile native catalog, stable identity, bounded inspection, and resume/fork translation |
+| `conversations` | Cross-profile native catalog, human-dialogue indexing, bounded inspection, and resume/fork translation |
 | `conversation_command` | Human/JSON rendering plus the narrow fzf selection protocol |
 | `sessions` | Backwards-compatible five-row `rtr here` view over `conversations` |
 | `tool_specs` | Native-home variables and skills relocation policy per tool |
@@ -42,10 +42,11 @@ Conversation opens take a separate policy-free path:
 
 ```text
 CLI / Herdr
- └─ conversations::query
-     ├─ Claude top-level project JSONL + native title records
-     └─ Codex rollout metadata + history/name indexes
+ ├─ conversations::query
+ │   ├─ Claude top-level project JSONL + native title records
+ │   └─ Codex rollout metadata + history/name indexes
  ├─ conversation_command::pick (optional fzf)
+ │   └─ complete user/assistant dialogue index for picker candidates
  └─ conversations::open
      ├─ native resume/fork argument translation
      └─ runner::run_isolated_profile_tool
@@ -61,8 +62,10 @@ usage-event machinery.
 Codex discovery reads its small indexes, the bounded rollout metadata prefix,
 and a bounded timestamp tail rather than scanning message bodies. Claude's much
 smaller top-level transcript corpus is scanned for cwd and native title records;
-nested subagent logs are excluded. fzf previews locate one transcript by the
-opaque key and read at most its tail.
+nested subagent logs are excluded. If fzf is required, the picker then streams
+each filtered candidate transcript once and indexes its complete user/assistant
+dialogue. Script output and exact opens retain the bounded discovery path. fzf
+previews locate one transcript by the opaque key and read at most its tail.
 
 `fix` skips selection and prepares an explicitly validated existing profile,
 so it shares the same environment, skills refresh, child execution, and usage

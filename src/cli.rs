@@ -198,9 +198,10 @@ machine-readable v1 contract; human output is for inspection only.")]
     #[command(long_about = "\
 Search Claude Code and Codex conversations across every configured native home.
 
-The interactive picker searches titles, prompts, paths, tools, profiles, and
-native IDs. Enter forks the selected conversation; Ctrl-R resumes it in place.
-Use --list or --json for non-interactive output.")]
+The interactive picker searches the complete user/assistant dialogue as well as
+titles, prompts, paths, tools, profiles, and native IDs. Enter forks the selected
+conversation; Ctrl-R resumes it in place. Use --list or --json for
+non-interactive output.")]
     Sessions(SessionsArgs),
     /// Fork an exact native conversation, or choose one interactively.
     #[command(long_about = "\

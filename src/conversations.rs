@@ -156,9 +156,11 @@ impl OpenMode {
 /// Build a point-in-time catalog from every configured isolated profile home.
 ///
 /// Codex summaries intentionally use only a bounded rollout prefix/tail plus
-/// its small history/name indexes. Full Codex message bodies are read only by
-/// [`inspect`] for one selected entry; Claude's much smaller transcripts are
-/// streamed once because their names and metadata can occur anywhere.
+/// its small history/name indexes. Interactive full-text indexing is a separate
+/// opt-in pass via [`searchable_transcript_text`], so list/JSON output and exact
+/// opens do not scan a multi-gigabyte rollout corpus. Claude's much smaller
+/// transcripts are streamed once because their names and metadata can occur
+/// anywhere.
 pub fn query(paths: &Paths, query: &ConversationQuery) -> Result<Catalog> {
     let config = Config::load(&paths.config_file())?;
     let mut catalog = Catalog {
@@ -221,6 +223,51 @@ pub fn query(paths: &Paths, query: &ConversationQuery) -> Result<Catalog> {
         catalog.conversations.truncate(limit);
     }
     Ok(catalog)
+}
+
+/// Build the complete human-dialogue search field for one picker candidate.
+///
+/// This deliberately reads the whole selected transcript, but indexes only
+/// user and assistant text. Tool payloads, reasoning records, and system or
+/// developer instructions would make results noisy and can dwarf the dialogue
+/// the user is trying to recover.
+pub fn searchable_transcript_text(conversation: &Conversation) -> Result<String> {
+    if !matches!(conversation.tool.as_str(), "claude" | "codex") {
+        anyhow::bail!("unsupported conversation tool '{}'", conversation.tool);
+    }
+    let file = File::open(&conversation.transcript_path)
+        .with_context(|| format!("opening {}", conversation.transcript_path.display()))?;
+    let mut output = String::new();
+    let mut previous = None;
+
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { continue };
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some((role, text)) = transcript_message(&record, &conversation.tool) else {
+            continue;
+        };
+        // fzf receives the dialogue as one TSV field. Collapsing whitespace and
+        // controls preserves every searchable word without corrupting the row
+        // protocol or letting a transcript inject terminal control sequences.
+        let text = display_text(&text, usize::MAX);
+        if text.is_empty()
+            || previous
+                .as_ref()
+                .is_some_and(|(previous_role, previous_text)| {
+                    previous_role == &role && previous_text == &text
+                })
+        {
+            continue;
+        }
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(&text);
+        previous = Some((role, text));
+    }
+    Ok(output)
 }
 
 /// Render a bounded transcript preview for one exact native conversation.
@@ -807,11 +854,7 @@ fn transcript_tail(path: &Path, tool: &str) -> Result<Vec<(String, String)>> {
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let extracted = match tool {
-            "claude" => claude_preview_message(&record),
-            "codex" => codex_preview_message(&record),
-            _ => None,
-        };
+        let extracted = transcript_message(&record, tool);
         let Some((role, text)) = extracted else {
             continue;
         };
@@ -835,7 +878,18 @@ fn transcript_tail(path: &Path, tool: &str) -> Result<Vec<(String, String)>> {
     Ok(messages)
 }
 
-fn claude_preview_message(record: &Value) -> Option<(String, String)> {
+fn transcript_message(record: &Value, tool: &str) -> Option<(String, String)> {
+    match tool {
+        "claude" => claude_transcript_message(record),
+        "codex" => codex_transcript_message(record),
+        _ => None,
+    }
+}
+
+fn claude_transcript_message(record: &Value) -> Option<(String, String)> {
+    if record.get("isMeta") == Some(&Value::Bool(true)) {
+        return None;
+    }
     let role = match record.get("type").and_then(Value::as_str)? {
         "user" => "user",
         "assistant" => "assistant",
@@ -845,7 +899,7 @@ fn claude_preview_message(record: &Value) -> Option<(String, String)> {
     Some((role.to_string(), text))
 }
 
-fn codex_preview_message(record: &Value) -> Option<(String, String)> {
+fn codex_transcript_message(record: &Value) -> Option<(String, String)> {
     let record_type = record.get("type").and_then(Value::as_str)?;
     let payload = record.get("payload")?;
     if record_type == "event_msg"
@@ -861,9 +915,12 @@ fn codex_preview_message(record: &Value) -> Option<(String, String)> {
     {
         return None;
     }
-    let role = payload.get("role").and_then(Value::as_str)?.to_string();
+    let role = payload.get("role").and_then(Value::as_str)?;
+    if !matches!(role, "user" | "assistant") {
+        return None;
+    }
     let text = message_content_text(payload.get("content")?)?;
-    Some((role, text))
+    Some((role.to_string(), text))
 }
 
 fn message_content_text(content: &Value) -> Option<String> {
@@ -1243,6 +1300,118 @@ command = ["codex"]
 
         assert_eq!(catalog.conversations.len(), 1);
         assert_eq!(catalog.conversations[0].id, "work-id");
+    }
+
+    #[test]
+    fn searchable_text_reads_dialogue_older_than_the_bounded_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("claude-full-search.jsonl");
+        let old_prompt = format!(
+            "old searchable needle {} marker-after-preview-message-limit",
+            "x".repeat(PREVIEW_MESSAGE_CHARS + 64)
+        );
+        let records = [
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": old_prompt}
+            }),
+            // This ignored record pushes the first user message outside the
+            // bounded preview tail without inflating the searchable dialogue.
+            serde_json::json!({
+                "type": "progress",
+                "payload": "x".repeat(PREVIEW_BYTES as usize + 1_024)
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": "recent answer"}
+            }),
+        ];
+        fs::write(
+            &transcript,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let mut conversation = test_conversation("claude", "eng", "search-id", "title");
+        conversation.transcript_path = transcript.clone();
+
+        let search_text = searchable_transcript_text(&conversation).unwrap();
+        let preview_text = transcript_tail(&transcript, "claude")
+            .unwrap()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            search_text.contains("old searchable needle"),
+            "{search_text}"
+        );
+        assert!(
+            search_text.contains("marker-after-preview-message-limit"),
+            "{search_text}"
+        );
+        assert!(search_text.contains("recent answer"), "{search_text}");
+        assert!(
+            !preview_text.contains("old searchable needle"),
+            "{preview_text}"
+        );
+    }
+
+    #[test]
+    fn searchable_text_omits_internal_codex_messages_and_duplicate_user_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcript = temp.path().join("codex-full-search.jsonl");
+        let records = [
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "repeat me once"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "repeat me once"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "developer",
+                    "content": [{"type": "input_text", "text": "internal routing secret"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "visible response"}]
+                }
+            }),
+        ];
+        fs::write(
+            &transcript,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let mut conversation = test_conversation("codex", "eng", "search-id", "title");
+        conversation.transcript_path = transcript;
+
+        let search_text = searchable_transcript_text(&conversation).unwrap();
+
+        assert_eq!(search_text.matches("repeat me once").count(), 1);
+        assert!(search_text.contains("visible response"), "{search_text}");
+        assert!(
+            !search_text.contains("internal routing secret"),
+            "{search_text}"
+        );
     }
 
     #[test]

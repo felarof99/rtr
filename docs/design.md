@@ -75,10 +75,13 @@ remain recoverable, rotation is unchanged, and a missing transcript is an error
 instead of permission to guess another session. The recorded cwd is restored
 when it still exists.
 
-The fzf adapter passes an encoded identity key in a hidden field. Searchable
-titles, prompts, paths, and profile labels cannot change which session opens.
-Preview is a separate bounded inspector, keeping interactive navigation
-independent of transcript size.
+The fzf adapter passes an encoded identity key in a hidden field. When a picker
+is needed, RTR streams each candidate transcript once and appends normalized
+user/assistant dialogue to its searchable row. Titles, prompts, paths, profile
+labels, and dialogue can filter a result but cannot change which session opens.
+Tool payloads and internal instructions are deliberately excluded. Preview is a
+separate bounded inspector, keeping result-to-result navigation independent of
+transcript size.
 
 ## Terminal Ownership
 
