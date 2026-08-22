@@ -36,6 +36,12 @@ Maintain profiles and config:
 Discover isolated homes for integrations:
   rtr paths --json
 
+Point a shell at one profile so plain claude/codex commands use it:
+  eval \"$(rtr shell-init zsh)\"    # one line in ~/.zshrc
+  rtr switch nit                 # or: rtrs nit
+  rtr switch claude nit
+  rtr switch nit claudexxx
+
 Resume work from the current directory:
   rtr here
 
@@ -241,6 +247,41 @@ profile, relative update time, session ID, and a profile-bound resume command.")
         #[arg(long)]
         today: bool,
     },
+    /// Point the current shell at one profile's isolated native home.
+    #[command(long_about = "\
+Switch a shell to one profile so plain `claude` and `codex` commands — including
+your own aliases — run in that profile's isolated native home.
+
+  rtr switch nit              both tools, if both configure 'nit'
+  rtr switch claude nit       Claude only
+  rtr switch nit claudexxx    switch, then run the command or alias
+
+A profile name selects every tool that configures it, because a profile names an
+account rather than a tool. Switching prepares the native home and runs startup
+copying exactly as a launch would, but leaves automatic rotation untouched.
+
+A child process cannot write to its parent shell, so the shell must apply the
+result. With `rtr shell-init zsh` loaded this happens in place; otherwise use
+`eval \"$(rtr switch nit)\"`, or pass a command and rtr will run it.")]
+    Switch(SwitchArgs),
+    /// Print shell integration that makes `rtr switch` affect the current shell.
+    #[command(
+        name = "shell-init",
+        long_about = "\
+Print shell integration for the named shell (currently zsh).
+
+Add one line to ~/.zshrc:
+
+  eval \"$(rtr shell-init zsh)\"
+
+This defines an `rtr` wrapper that applies `rtr switch` to the running shell,
+adds `rtrs` as a shortcut, and re-exports the last switch in every new shell.
+Every other rtr command is passed straight through to the binary."
+    )]
+    ShellInit {
+        /// Shell to emit integration for: zsh.
+        shell: String,
+    },
     /// Show configured tools and profiles.
     Status { tool: Option<String> },
 }
@@ -257,6 +298,19 @@ pub struct ToolRunArgs {
     #[arg(short = 'p', long)]
     pub profile: Option<String>,
     /// Arguments passed through to the selected tool.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SwitchArgs {
+    /// Restrict the switch to one tool.
+    #[arg(long, value_parser = ["claude", "codex"])]
+    pub tool: Option<String>,
+    /// Emit a zsh script instead of exports; used by the shell-init wrapper.
+    #[arg(long, hide = true)]
+    pub emit_zsh: bool,
+    /// Profile (or `<tool> <profile>`), then an optional command to run.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }
@@ -465,6 +519,64 @@ mod tests {
     }
 
     #[test]
+    fn parse_switch_keeps_the_trailing_command_intact() {
+        match parse_from(["switch", "nit", "claudexxx", "--resume"]).cmd {
+            Cmd::Switch(args) => {
+                assert_eq!(args.tool, None);
+                assert!(!args.emit_zsh);
+                assert_eq!(args.args, v(&["nit", "claudexxx", "--resume"]));
+            }
+            other => panic!("expected switch, got {other:?}"),
+        }
+
+        match parse_from(["switch", "--emit-zsh", "claude", "eng"]).cmd {
+            Cmd::Switch(args) => {
+                assert!(args.emit_zsh);
+                assert_eq!(args.args, v(&["claude", "eng"]));
+            }
+            other => panic!("expected switch, got {other:?}"),
+        }
+
+        match parse_from(["switch", "--tool", "codex", "nik"]).cmd {
+            Cmd::Switch(args) => {
+                assert_eq!(args.tool.as_deref(), Some("codex"));
+                assert_eq!(args.args, v(&["nik"]));
+            }
+            other => panic!("expected switch, got {other:?}"),
+        }
+
+        assert!(matches!(
+            parse_from(["shell-init", "zsh"]).cmd,
+            Cmd::ShellInit { shell } if shell == "zsh"
+        ));
+        assert!(
+            Cli::try_parse_from(["rtr", "switch", "--tool", "fish", "nit"]).is_err(),
+            "unknown tool accepted"
+        );
+    }
+
+    #[test]
+    fn switch_help_explains_the_shell_boundary() {
+        let switch = help_for(&["switch"]);
+        assert!(switch.contains("rtr switch nit claudexxx"), "{switch}");
+        assert!(
+            switch.contains("leaves automatic rotation untouched"),
+            "{switch}"
+        );
+        assert!(
+            switch.contains("A child process cannot write to its parent shell"),
+            "{switch}"
+        );
+
+        let shell_init = help_for(&["shell-init"]);
+        assert!(
+            shell_init.contains("eval \"$(rtr shell-init zsh)\""),
+            "{shell_init}"
+        );
+        assert!(shell_init.contains("rtrs"), "{shell_init}");
+    }
+
+    #[test]
     fn parse_conversation_picker_and_direct_open_commands() {
         match parse_from([
             "sessions",
@@ -556,6 +668,10 @@ mod tests {
             "rtr config edit",
             "Discover isolated homes for integrations:",
             "rtr paths --json",
+            "Point a shell at one profile so plain claude/codex commands use it:",
+            "rtr switch nit",
+            "rtr switch claude nit",
+            "rtr switch nit claudexxx",
             "Resume work from the current directory:",
             "rtr here",
             "Search every native conversation (Enter forks; Ctrl-R resumes):",
@@ -696,7 +812,6 @@ mod tests {
             vec!["trust"],
             vec!["untrust"],
             vec!["ca", "path"],
-            vec!["switch", "codex", "work"],
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("rtr").chain(args.iter().copied())).is_err(),

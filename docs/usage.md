@@ -149,6 +149,52 @@ Use `--` to force the rest of the command line to the child:
 rtr codex -p personal -- --profile child-profile
 ```
 
+## Switch a Shell to One Profile
+
+```bash
+eval "$(rtr shell-init zsh)"
+```
+
+Add that one line to `~/.zshrc`. It defines an `rtr` shell wrapper that applies
+`switch` to the running shell, adds `rtrs` as a shortcut for `rtr switch`, and
+re-exports the last switch in every new shell. All other subcommands are handed
+to the binary unchanged.
+
+```bash
+rtr switch eng             # every tool configuring 'eng'
+rtr switch claude eng      # one tool
+rtr switch eng claudexxx   # switch, then run a command or shell alias
+```
+
+Once switched, plain `claude` and `codex` invocations — including personal
+aliases and scripts run from that shell — use the profile's isolated home,
+because `switch` exports the same variables a launch would set:
+
+| Tool | Exported |
+|---|---|
+| claude | `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `RTR_PROFILE_CLAUDE` |
+| codex | `CODEX_HOME`, `RTR_PROFILE_CODEX` |
+
+A bare profile name applies to every tool that configures it. A leading `claude`
+or `codex` is read as a tool only when another positional follows it, so
+`rtr switch nit claudexxx` still treats `nit` as the profile. Use `--tool` to
+address a profile that is itself named `claude` or `codex`.
+
+Switching prepares the native home and runs startup copying exactly as a launch
+would. It does not touch rotation: a later bare `rtr codex` selects the same
+profile it would have before. Disabled profiles are refused, and bypassed
+profiles are skipped with a note, because a bypassed profile deliberately has no
+isolated home to point at.
+
+The selection persists in `state.toml`, so a new shell adopts it. Restoring on
+shell startup only re-exports paths; it never recreates a home that has been
+deleted.
+
+Without the integration loaded, `rtr switch <profile>` prints exports for
+`eval "$(rtr switch <profile>)"` and leaves the current shell unchanged. Passing
+a command runs it directly when it is an executable, or through `$SHELL -i -c`
+when it is a shell alias.
+
 ## Automatic Rotation
 
 Without `--profile`, rtr chooses enabled profiles in lexicographic order and

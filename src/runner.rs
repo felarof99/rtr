@@ -170,7 +170,7 @@ fn native_home_env_keys(spec: &tool_specs::ToolSpec) -> Vec<String> {
     keys
 }
 
-fn prepare_native_profile_env(
+pub(crate) fn prepare_native_profile_env(
     paths: &Paths,
     spec: &tool_specs::ToolSpec,
     tool: &Tool,
@@ -1301,11 +1301,42 @@ async fn execute_tool(
     child_env_remove: Vec<String>,
     child_cwd: Option<PathBuf>,
 ) -> Result<i32> {
+    execute_program(
+        &tool.command[0],
+        &tool.command[1..],
+        child_args,
+        child_env,
+        child_env_remove,
+        child_cwd,
+    )
+    .await
+}
+
+/// Spawn one program as a direct child that owns the terminal.
+///
+/// Kept separate from `execute_tool` because `rtr switch` runs a command the
+/// user named rather than a configured tool, while needing identical terminal
+/// handoff and signal forwarding.
+pub(crate) async fn execute_program(
+    program: &str,
+    leading_args: &[String],
+    child_args: Vec<String>,
+    child_env: Vec<(String, std::ffi::OsString)>,
+    child_env_remove: Vec<String>,
+    child_cwd: Option<PathBuf>,
+) -> Result<i32> {
     let mut signals = ChildSignals::new()?;
-    let mut command = build_tool_command(tool, child_args, child_env, child_env_remove, child_cwd);
+    let mut command = build_program_command(
+        program,
+        leading_args,
+        child_args,
+        child_env,
+        child_env_remove,
+        child_cwd,
+    );
     let mut child = command
         .spawn()
-        .with_context(|| format!("spawning '{}'", tool.command[0]))?;
+        .with_context(|| format!("spawning '{program}'"))?;
     let child_pid = child.id().context("spawned child has no process id")? as i32;
     let mut foreground_terminal = ForegroundTerminal::handoff(child_pid)?;
     let status = loop {
@@ -1327,15 +1358,16 @@ async fn execute_tool(
 }
 
 /// Build a child command with rtr-owned environment changes applied.
-fn build_tool_command(
-    tool: &Tool,
+fn build_program_command(
+    program: &str,
+    leading_args: &[String],
     child_args: Vec<String>,
     child_env: Vec<(String, std::ffi::OsString)>,
     child_env_remove: Vec<String>,
     child_cwd: Option<PathBuf>,
 ) -> Command {
-    let mut command = Command::new(&tool.command[0]);
-    command.args(&tool.command[1..]).args(child_args);
+    let mut command = Command::new(program);
+    command.args(leading_args).args(child_args);
     for key in child_env_remove {
         command.env_remove(key);
     }
@@ -1638,8 +1670,10 @@ mod tests {
     #[test]
     fn child_command_applies_native_home_removals() {
         let config = Config::parse("[tools.codex]\ncommand=[\"codex\"]\n").unwrap();
-        let command = build_tool_command(
-            config.tool("codex").unwrap(),
+        let tool = config.tool("codex").unwrap();
+        let command = build_program_command(
+            &tool.command[0],
+            &tool.command[1..],
             Vec::new(),
             Vec::new(),
             vec!["CODEX_HOME".to_string()],

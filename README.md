@@ -65,6 +65,16 @@ Use `--` when a child argument should not be parsed by rtr:
 rtr codex -- --profile native-codex-profile
 ```
 
+Point a shell at one profile so plain `claude` and `codex` commands — including
+your own aliases — run in that profile's isolated home:
+
+```bash
+eval "$(rtr shell-init zsh)"   # one line in ~/.zshrc
+rtr switch personal            # or the rtrs shortcut
+rtr switch claude personal     # one tool only
+rtr switch personal codexxx    # switch, then run a command or alias
+```
+
 Pause a profile and bring it back later:
 
 ```bash
@@ -143,6 +153,8 @@ rtr fix <claude|codex> --profile <name>
 rtr config [edit]
 rtr claude [-p|--profile <name>] [claude args...]
 rtr codex  [-p|--profile <name>] [codex args...]
+rtr switch [<claude|codex>] <profile> [command...] [--tool <claude|codex>]
+rtr shell-init zsh
 rtr enable <claude|codex> --profile <name>
 rtr disable <claude|codex> --profile <name>
 rtr bypass <claude|codex> --profile <name>
@@ -212,6 +224,42 @@ Claude receives profile-specific `CLAUDE_CONFIG_DIR` and
 `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Codex receives profile-specific
 `CODEX_HOME`. rtr does not read or copy credentials.
 
+## Switching a Shell
+
+Every other command launches a child and can hand it the profile directly. A
+child cannot write to its parent shell, so `switch` emits `export` lines and
+lets the shell apply them. Load the integration once:
+
+```bash
+eval "$(rtr shell-init zsh)"
+```
+
+That defines an `rtr` wrapper which intercepts only `switch`, adds `rtrs` as a
+shortcut, and re-exports the last switch in every new shell. Every other command
+is passed straight through to the binary.
+
+```bash
+rtr switch eng             # every tool that configures 'eng'
+rtr switch claude eng      # Claude only
+rtr switch eng claudexxx   # switch, then run a command or alias
+rtrs eng
+```
+
+A bare profile name selects every tool that configures it, because a profile
+names an account rather than a tool. Use `--tool` when a profile is itself named
+`claude` or `codex`. Switching prepares the native home and runs startup copying
+exactly as a launch would, but leaves automatic rotation untouched, so a bare
+`rtr codex` still rotates as before. Disabled profiles are refused and bypassed
+profiles are skipped, since neither has an isolated home to point at.
+
+Alongside each native home, `switch` exports `RTR_PROFILE_CLAUDE` and
+`RTR_PROFILE_CODEX` so a prompt can show the current identity.
+
+Without the integration loaded, `rtr switch <profile>` prints the exports for
+`eval "$(rtr switch <profile>)"`, and `rtr switch <profile> <command>` runs the
+command itself — through `$SHELL -i -c` when the name is a shell alias rather
+than an executable.
+
 ## Profile Home Discovery
 
 `rtr paths` lists the resolved isolated native home for every configured Claude
@@ -232,7 +280,7 @@ or sessions.
 |---|---|
 | `~/.config/rtr/config.toml` | Tool and profile config |
 | `~/.local/state/rtr/homes/<tool>/<profile>/` | Isolated native tool home |
-| `~/.local/state/rtr/state.toml` | Rotation cursors |
+| `~/.local/state/rtr/state.toml` | Rotation cursors and the switched profile |
 | `~/.local/state/rtr/usage.jsonl` | Launch history and exit codes |
 
 Set `RTR_CONFIG_DIR` and `RTR_STATE_DIR` to override the two base directories.

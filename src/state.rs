@@ -1,4 +1,4 @@
-//! `state.toml`: round-robin cursors for automatic profile selection.
+//! `state.toml`: round-robin cursors and the shell-switched profile.
 //!
 //! Kept separate from `config.toml` so launches never rewrite the user's
 //! hand-edited configuration.
@@ -14,6 +14,12 @@ use serde::{Deserialize, Serialize};
 pub struct State {
     #[serde(default)]
     pub round_robin: BTreeMap<String, usize>,
+    /// Tool name to the profile `rtr switch` last selected for it.
+    ///
+    /// Only shells read this; selection and rotation ignore it, so a switch
+    /// never changes which profile a bare `rtr claude` picks.
+    #[serde(default)]
+    pub current: BTreeMap<String, String>,
 }
 
 impl State {
@@ -51,6 +57,14 @@ impl State {
 
     pub fn set_round_robin_cursor(&mut self, tool: &str, cursor: usize) {
         self.round_robin.insert(tool.to_string(), cursor);
+    }
+
+    pub fn current_profile(&self, tool: &str) -> Option<&str> {
+        self.current.get(tool).map(String::as_str)
+    }
+
+    pub fn set_current_profile(&mut self, tool: &str, profile: &str) {
+        self.current.insert(tool.to_string(), profile.to_string());
     }
 }
 
@@ -91,6 +105,40 @@ mod tests {
         })
         .unwrap();
         assert_eq!(State::load(&path).unwrap().round_robin_cursor("codex"), 2);
+    }
+
+    #[test]
+    fn current_profile_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime").join("state.toml");
+        State::update_locked(&path, |st| {
+            st.set_current_profile("claude", "nit");
+            st.set_current_profile("codex", "eng");
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = State::load(&path).unwrap();
+        assert_eq!(loaded.current_profile("claude"), Some("nit"));
+        assert_eq!(loaded.current_profile("codex"), Some("eng"));
+        assert_eq!(loaded.current_profile("nope"), None);
+    }
+
+    #[test]
+    fn switching_does_not_disturb_rotation_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        State::update_locked(&path, |st| {
+            st.set_round_robin_cursor("codex", 3);
+            Ok(())
+        })
+        .unwrap();
+        State::update_locked(&path, |st| {
+            st.set_current_profile("codex", "eng");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(State::load(&path).unwrap().round_robin_cursor("codex"), 3);
     }
 
     #[test]
