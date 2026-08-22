@@ -16,6 +16,8 @@ pub mod profiles;
 pub mod runner;
 pub mod selection;
 pub mod state;
+pub mod switch;
+pub mod switch_command;
 pub mod tool_specs;
 pub mod usage;
 mod weights;
@@ -148,6 +150,14 @@ pub async fn run() -> Result<()> {
         Cmd::ConversationPreview { key } => conversation_command::print_preview(&paths, &key),
         Cmd::Ls { all, output } => profile_overview::run(&paths, all, output.color.stdout()),
         Cmd::Show { tool, profile } => profiles::run_show_profile(&paths, &tool, &profile),
+        Cmd::Switch(args) => {
+            let code = switch_command::run_switch(&paths, args).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Cmd::ShellInit { shell } => switch_command::print_shell_init(&paths, &shell),
         Cmd::Status { tool } => profiles::print_status(&paths, tool.as_deref()),
         Cmd::Weight(args) => weights::run(&paths, &args),
     }

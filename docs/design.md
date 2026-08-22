@@ -109,6 +109,28 @@ Unix terminal signals and forwards them to the direct child so it can finish
 and produce a real status before usage is recorded. rtr also sets
 `kill_on_drop` for cancellation paths.
 
+## Switching a Shell
+
+Launches express profile choice in the child's environment. A shell switch has
+the opposite direction: the process that must change is rtr's own parent, and no
+child can write to it. `switch` therefore produces `export` lines as data and
+leaves application to the shell, either through the `shell-init` wrapper or an
+explicit `eval`.
+
+Only `switch` is intercepted by that wrapper. Every other subcommand reaches the
+binary unchanged, so the shell integration cannot drift from the real command
+surface as commands are added.
+
+A trailing command is evaluated in the caller's shell rather than a child so
+aliases and functions resolve exactly as typed; that is the point of
+`rtr switch <profile> <alias>`. When rtr must run the command itself it prefers
+a direct child for terminal and signal fidelity, and falls back to `$SHELL -i -c`
+only for names no `PATH` lookup can resolve.
+
+The switched profile is stored beside the rotation cursors but is read only by
+shells. Selection ignores it, so switching never silently changes which profile
+a bare `rtr codex` picks.
+
 ## Skills Refresh
 
 The selected home receives a fresh `skills` tree on every launch. rtr copies to
@@ -144,7 +166,8 @@ Codex's generated `.system` cache, and rolls back if staged installation fails.
 ## State and Concurrency
 
 Config remains hand-editable and is never rewritten during launch. Mutable
-round-robin cursors and weighted scores live in `state.toml`; usage events live in `usage.jsonl`.
+round-robin cursors, weighted scores, and shell-switched profiles live in
+`state.toml`; usage events live in `usage.jsonl`.
 Both use advisory locks, and state replacement is atomic.
 
 Percentage overrides are fixed shares of automatic selections; unassigned
