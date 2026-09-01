@@ -204,6 +204,14 @@ Destinations use the selected profile home for both relative paths and `~/...`.
 Omit `copy` to retain the built-in skills refresh (and optional legacy
 `skills_source` override), or set `copy = []` to disable startup copying.
 
+Profiles keep the MCP servers registered in each tool's main config
+(`~/.claude.json`, `~/.codex/config.toml`) — so a server an app such as
+BrowserOS Neo adds there shows up inside rtr sessions on the next launch or
+`rtr switch`. Only the MCP section is inherited, never the rest of that file,
+and a server you add or customize inside a profile always wins. Set
+`inherit_mcp = false` on a tool to freeze its profiles. See
+[docs/usage.md](docs/usage.md) for the full rules.
+
 `args` supplies native CLI defaults to normal launches, resumes, and forks.
 Explicit arguments replace matching `--model` / `--effort` defaults and matching
 Codex `-c` keys; repeated dangerous-permission flags collapse to one.
@@ -280,6 +288,7 @@ or sessions.
 |---|---|
 | `~/.config/rtr/config.toml` | Tool and profile config |
 | `~/.local/state/rtr/homes/<tool>/<profile>/` | Isolated native tool home |
+| `~/.local/state/rtr/homes/<tool>/<profile>/.rtr-inherited.json` | MCP servers rtr inherited into that home |
 | `~/.local/state/rtr/state.toml` | Rotation cursors and the switched profile |
 | `~/.local/state/rtr/usage.jsonl` | Launch history and exit codes |
 

@@ -6,6 +6,7 @@ pub mod config_command;
 pub mod conversation_command;
 pub mod conversations;
 mod file_lock;
+pub mod inherit;
 pub mod paths;
 pub mod profile_paths;
 pub mod profiles;

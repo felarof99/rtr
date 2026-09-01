@@ -29,6 +29,14 @@ pub struct Tool {
     pub skills_source: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy: Option<Vec<CopyMapping>>,
+    /// Keep this tool's profiles in step with the MCP servers registered in its
+    /// main config (`~/.claude.json`, `~/.codex/config.toml`).
+    ///
+    /// Only the MCP section is inherited; every other section of the main
+    /// config stays out of profile homes, and a server the profile customized
+    /// is never overwritten. Set `false` to freeze a tool's profiles.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub inherit_mcp: bool,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
 }
@@ -367,6 +375,23 @@ mod tests {
         let codex = cfg.tool("codex").unwrap();
         assert_eq!(codex.command, vec!["codex"]);
         assert!(codex.profiles.is_empty());
+    }
+
+    #[test]
+    fn inherit_mcp_defaults_on_and_serializes_only_when_disabled() {
+        let cfg = Config::parse(
+            "[tools.claude]\ncommand = [\"claude\"]\n[tools.codex]\ncommand = [\"codex\"]\ninherit_mcp = false\n",
+        )
+        .unwrap();
+        assert!(cfg.tool("claude").unwrap().inherit_mcp);
+        assert!(!cfg.tool("codex").unwrap().inherit_mcp);
+
+        let serialized = cfg.to_toml().unwrap();
+        assert_eq!(serialized.matches("inherit_mcp").count(), 1, "{serialized}");
+        assert!(!serialized.contains("inherit_mcp = true"), "{serialized}");
+        let round_tripped = Config::parse(&serialized).unwrap();
+        assert!(round_tripped.tool("claude").unwrap().inherit_mcp);
+        assert!(!round_tripped.tool("codex").unwrap().inherit_mcp);
     }
 
     #[test]

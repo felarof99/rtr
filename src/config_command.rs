@@ -54,6 +54,7 @@ mod tests {
         Paths {
             config_dir: PathBuf::from("/tmp/rtr-config"),
             state_dir: PathBuf::from("/tmp/rtr-state"),
+            home_dir: PathBuf::from("/h"),
         }
     }
 

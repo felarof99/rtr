@@ -177,8 +177,10 @@ pub(crate) fn prepare_native_profile_env(
     profile_name: &str,
 ) -> Result<Vec<(String, std::ffi::OsString)>> {
     let home = paths.ensure_profile_home_dir(spec.name, profile_name)?;
-    let user_home = crate::home_dir()?;
-    sync_profile_startup(spec, tool, &home, &paths.config_dir, &user_home)?;
+    sync_profile_startup(spec, tool, &home, &paths.config_dir, &paths.home_dir)?;
+    // Shared MCP servers land after the startup copy so a `copy` mapping that
+    // ships a config file is the profile's own content, which inherit respects.
+    crate::inherit::sync_profile_best_effort(paths, spec, tool, &home);
     let mut env = vec![(
         spec.native_home_env.to_string(),
         home.clone().into_os_string(),
@@ -1552,6 +1554,7 @@ mod tests {
         Paths {
             config_dir: root.join("config"),
             state_dir: root.join("state"),
+            home_dir: root.join("home"),
         }
     }
 

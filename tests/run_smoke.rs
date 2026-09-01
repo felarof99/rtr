@@ -15,6 +15,7 @@ fn test_paths(root: &Path) -> Paths {
     Paths {
         config_dir: root.join("config"),
         state_dir: root.join("state"),
+        home_dir: root.join("home"),
     }
 }
 
@@ -554,6 +555,7 @@ copy = [
     for (tool, profile) in [("claude", "work"), ("codex", "personal")] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_rtr"))
             .args([tool, "--profile", profile])
+            .env("HOME", temp.path())
             .env("RTR_CONFIG_DIR", &paths.config_dir)
             .env("RTR_STATE_DIR", &paths.state_dir)
             .output()
@@ -566,6 +568,7 @@ copy = [
     for (tool, profile) in [("claude", "work"), ("codex", "personal")] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_rtr"))
             .args([tool, "--profile", profile])
+            .env("HOME", temp.path())
             .env("RTR_CONFIG_DIR", &paths.config_dir)
             .env("RTR_STATE_DIR", &paths.state_dir)
             .output()
@@ -1435,4 +1438,285 @@ skills_source = {}
         usage::read_events(&paths.usage_file()).unwrap()[0].exit_code,
         Some(42)
     );
+}
+
+/// Main config carrying both a shared MCP section and tool-wide settings that
+/// must never reach a profile.
+const MAIN_CODEX_CONFIG: &str = r#"model = "gpt-main"
+personality = "main-only"
+
+[projects."/somewhere/else"]
+trust_level = "trusted"
+
+[mcp_servers.browseros-neo]
+url = "http://127.0.0.1:9010/mcp"
+
+[mcp_servers.node_repl]
+command = "node"
+
+[mcp_servers.node_repl.env]
+NODE_ENV = "main"
+
+[hooks.state]
+enabled = true
+"#;
+
+fn user_home(root: &Path) -> PathBuf {
+    let home = root.join("user-home");
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    home
+}
+
+fn run_rtr(paths: &Paths, home: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_rtr"))
+        .args(args)
+        .env("HOME", home)
+        .env("RTR_CONFIG_DIR", &paths.config_dir)
+        .env("RTR_STATE_DIR", &paths.state_dir)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn launch_inherits_main_mcp_servers_without_leaking_other_main_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let home = user_home(temp.path());
+    std::fs::write(home.join(".codex/config.toml"), MAIN_CODEX_CONFIG).unwrap();
+    write_config(
+        &paths,
+        r#"
+[tools.codex]
+command = ["sh", "-c", "grep -q 'mcp_servers.browseros-neo' \"$CODEX_HOME/config.toml\""]
+
+[tools.codex.profiles.personal]
+"#,
+    );
+
+    let output = run_rtr(&paths, &home, &["codex", "--profile", "personal"]);
+    assert!(output.status.success(), "{output:?}");
+
+    let profile_config = std::fs::read_to_string(
+        paths
+            .profile_home_dir("codex", "personal")
+            .join("config.toml"),
+    )
+    .unwrap();
+    // Every MCP server, including its nested subtable, crossed over.
+    for expected in [
+        "[mcp_servers.browseros-neo]",
+        "url = \"http://127.0.0.1:9010/mcp\"",
+        "[mcp_servers.node_repl]",
+        "[mcp_servers.node_repl.env]",
+        "NODE_ENV = \"main\"",
+    ] {
+        assert!(
+            profile_config.contains(expected),
+            "missing {expected}:\n{profile_config}"
+        );
+    }
+    // Nothing else did. These break a profile if they leak.
+    for leaked in [
+        "gpt-main",
+        "personality",
+        "/somewhere/else",
+        "hooks",
+        "trust_level",
+    ] {
+        assert!(
+            !profile_config.contains(leaked),
+            "leaked {leaked}:\n{profile_config}"
+        );
+    }
+}
+
+#[test]
+fn later_launches_track_main_while_profile_edits_win() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let home = user_home(temp.path());
+    let main_config = home.join(".codex/config.toml");
+    std::fs::write(
+        &main_config,
+        "[mcp_servers.shared]\ncommand = \"v1\"\n\n[mcp_servers.retired]\ncommand = \"old\"\n",
+    )
+    .unwrap();
+    write_config(
+        &paths,
+        r#"
+[tools.codex]
+command = ["true"]
+
+[tools.codex.profiles.personal]
+"#,
+    );
+    let profile_config = paths
+        .profile_home_dir("codex", "personal")
+        .join("config.toml");
+
+    assert!(run_rtr(&paths, &home, &["codex", "-p", "personal"])
+        .status
+        .success());
+    assert!(std::fs::read_to_string(&profile_config)
+        .unwrap()
+        .contains("command = \"v1\""));
+
+    // The profile customizes one server; main changes both and retires a third.
+    std::fs::write(
+        &profile_config,
+        "[mcp_servers.shared]\ncommand = \"v1\"\nargs = [\"--profile-only\"]\n\n[mcp_servers.retired]\ncommand = \"old\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &main_config,
+        "[mcp_servers.shared]\ncommand = \"v2\"\n\n[mcp_servers.fresh]\ncommand = \"new\"\n",
+    )
+    .unwrap();
+
+    assert!(run_rtr(&paths, &home, &["codex", "-p", "personal"])
+        .status
+        .success());
+
+    let updated = std::fs::read_to_string(&profile_config).unwrap();
+    // The profile's own edit is authoritative...
+    assert!(updated.contains("--profile-only"), "{updated}");
+    assert!(!updated.contains("v2"), "{updated}");
+    // ...a new shared server still arrives...
+    assert!(updated.contains("[mcp_servers.fresh]"), "{updated}");
+    // ...and one main retired is withdrawn again.
+    assert!(!updated.contains("retired"), "{updated}");
+}
+
+#[test]
+fn switch_inherits_shared_mcp_servers_into_the_home_it_exports() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let home = user_home(temp.path());
+    std::fs::write(
+        home.join(".codex/config.toml"),
+        "[mcp_servers.browseros-neo]\nurl = \"http://127.0.0.1:9010/mcp\"\n",
+    )
+    .unwrap();
+    write_config(
+        &paths,
+        r#"
+[tools.codex]
+command = ["true"]
+
+[tools.codex.profiles.eng]
+"#,
+    );
+
+    let output = run_rtr(&paths, &home, &["switch", "eng"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("export CODEX_HOME="), "{stdout}");
+    assert!(
+        std::fs::read_to_string(paths.profile_home_dir("codex", "eng").join("config.toml"))
+            .unwrap()
+            .contains("[mcp_servers.browseros-neo]")
+    );
+}
+
+#[test]
+fn claude_launch_inherits_servers_without_disturbing_profile_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let home = user_home(temp.path());
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{"userID":"main-account","mcpServers":{"granola":{"type":"http","url":"https://mcp.granola.ai/mcp"}}}"#,
+    )
+    .unwrap();
+    let profile_home = paths.profile_home_dir("claude", "work");
+    std::fs::create_dir_all(&profile_home).unwrap();
+    std::fs::write(
+        profile_home.join(".claude.json"),
+        r#"{"userID":"profile-account","oauthAccount":{"emailAddress":"work@example.com"}}"#,
+    )
+    .unwrap();
+    write_config(
+        &paths,
+        r#"
+[tools.claude]
+command = ["true"]
+
+[tools.claude.profiles.work]
+"#,
+    );
+
+    assert!(run_rtr(&paths, &home, &["claude", "-p", "work"])
+        .status
+        .success());
+
+    let profile: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(profile_home.join(".claude.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        profile["mcpServers"]["granola"]["url"],
+        "https://mcp.granola.ai/mcp"
+    );
+    // The profile keeps its own account; only the server map was touched.
+    assert_eq!(profile["userID"], "profile-account");
+    assert_eq!(profile["oauthAccount"]["emailAddress"], "work@example.com");
+}
+
+#[test]
+fn inherit_mcp_false_freezes_a_tools_profiles() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let home = user_home(temp.path());
+    std::fs::write(
+        home.join(".codex/config.toml"),
+        "[mcp_servers.browseros-neo]\nurl = \"http://127.0.0.1:9010/mcp\"\n",
+    )
+    .unwrap();
+    write_config(
+        &paths,
+        r#"
+[tools.codex]
+command = ["true"]
+inherit_mcp = false
+
+[tools.codex.profiles.personal]
+"#,
+    );
+
+    assert!(run_rtr(&paths, &home, &["codex", "-p", "personal"])
+        .status
+        .success());
+
+    assert!(!paths
+        .profile_home_dir("codex", "personal")
+        .join("config.toml")
+        .exists());
+}
+
+#[test]
+fn a_malformed_main_config_warns_but_still_launches() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let home = user_home(temp.path());
+    std::fs::write(home.join(".codex/config.toml"), "definitely [[ not toml").unwrap();
+    let marker = temp.path().join("launched.txt");
+    write_config(
+        &paths,
+        &format!(
+            r#"
+[tools.codex]
+command = ["sh", "-c", "printf ran > {}"]
+
+[tools.codex.profiles.personal]
+"#,
+            marker.display()
+        ),
+    );
+
+    let output = run_rtr(&paths, &home, &["codex", "-p", "personal"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("could not inherit MCP servers"), "{stderr}");
 }
