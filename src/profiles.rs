@@ -408,6 +408,7 @@ mod tests {
         Paths {
             config_dir: root.join("config"),
             state_dir: root.join("state"),
+            home_dir: root.join("home"),
         }
     }
 
@@ -717,6 +718,7 @@ mod tests {
         let paths = Paths {
             config_dir: PathBuf::from("/config"),
             state_dir: PathBuf::from("/state"),
+            home_dir: PathBuf::from("/h"),
         };
         let status = render_status(&paths, &cfg, None).unwrap();
         assert!(status.contains("  codex\n"), "{status}");
@@ -753,6 +755,7 @@ mod tests {
         let paths = Paths {
             config_dir: PathBuf::from("/config"),
             state_dir: PathBuf::from("/state"),
+            home_dir: PathBuf::from("/h"),
         };
         let status = render_status(&paths, &cfg, None).unwrap();
         assert!(

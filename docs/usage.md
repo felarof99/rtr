@@ -93,6 +93,7 @@ enabled = false
 command = ["codex"]
 args = ["-m", "gpt-5.6-sol", "-c", "model_reasoning_effort=max"]
 skills_source = "shared/codex-skills"
+inherit_mcp = false
 
 [tools.codex.profiles.work]
 
@@ -106,6 +107,7 @@ bypass = true
 | `args` | Native defaults for every launch; explicit runtime model/effort/config options override matching defaults |
 | `copy` | Optional tool-level list of `{ source, destination }` startup mappings; `[]` disables startup copying |
 | `skills_source` | Backwards-compatible skills source used only when `copy` is omitted |
+| `inherit_mcp` | Whether profiles track the MCP servers registered in the tool's main config; default `true` |
 | `profiles.<name>.enabled` | Whether selection may use the profile; managed by `rtr enable <tool> --profile <name>` / `rtr disable <tool> --profile <name>` |
 | `profiles.<name>.bypass` | Whether runs use the tool's default home instead of the isolated native home; managed by `rtr bypass <tool> --profile <name>` / `rtr unbypass <tool> --profile <name>` |
 
@@ -409,6 +411,55 @@ the configured source or a distinct legacy `~/.codex/skills`, excluding source
 External relative skill symlinks are rebased so they stay usable after copying
 into a profile home. Internal and dangling relative links stay verbatim.
 
+## Shared MCP Servers
+
+Apps register their MCP servers in each tool's *main* config — `~/.claude.json`
+under `mcpServers`, `~/.codex/config.toml` under `[mcp_servers.*]`. A profile
+home is a separate native home, so it would never see those additions and the
+servers would simply be missing inside rtr sessions.
+
+Every non-bypassed launch and every `rtr switch` therefore copies the MCP
+section — and only that section — from the main config into the selected profile
+home, before the child starts. Nothing else crosses over: `~/.codex/config.toml`
+also carries `model`, `personality`, `notify`, `hooks`, `plugins` and per-project
+trust, and those change how a profile behaves. Identity is likewise untouched,
+because it lives elsewhere: Codex auth in `auth.json`, Claude's in `oauthAccount`
+and `userID` plus secure storage.
+
+The sync is one-way, main to profile. **A profile's own edits always win.**
+
+rtr records what it injected in `<profile-home>/.rtr-inherited.json`, which is
+what lets it tell its own entries apart from yours:
+
+| In the profile | rtr does |
+|---|---|
+| Server is missing | Inject it from main |
+| Server is exactly as rtr injected it, and main changed | Update it |
+| Server was added or customized in the profile | Leave it, and stop tracking it |
+| Server rtr injected is gone from main | Remove it |
+| Server rtr injected is gone from main, but you edited it | Keep your version |
+
+So customizing an inherited server in a profile makes it yours permanently:
+later main changes no longer touch it. Delete it from the profile and the next
+launch re-injects main's version. Servers added to a profile by hand are never
+touched at all, whether or not main defines a server of the same name.
+
+Freeze one tool's profiles with:
+
+```toml
+[tools.codex]
+command = ["codex"]
+inherit_mcp = false
+```
+
+A new profile is seeded the same way on its first launch, so `rtr add` produces
+a home that already has the shared servers.
+
+Inheritance never blocks a launch. A missing main config is skipped silently; a
+malformed one prints a warning to stderr and the tool still starts. Writes are
+atomic and happen under a per-profile lock, and a run that changes nothing
+rewrites nothing.
+
 ## Inspect Profiles and Usage
 
 ```bash
@@ -494,6 +545,7 @@ The defaults are:
 |---|---|
 | `~/.config/rtr/config.toml` | Tool and profile configuration |
 | `~/.local/state/rtr/homes/<tool>/<profile>/` | Isolated native tool home |
+| `~/.local/state/rtr/homes/<tool>/<profile>/.rtr-inherited.json` | Which MCP servers in that home rtr inherited, and their fingerprints |
 | `~/.local/state/rtr/state.toml` | Round-robin cursors |
 | `~/.local/state/rtr/usage.jsonl` | Per-launch tool, profile, timestamp, exit code, and bypass marker when active |
 

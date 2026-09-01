@@ -121,6 +121,7 @@ mod tests {
         Paths {
             config_dir: root.join("config"),
             state_dir: root.join("state"),
+            home_dir: root.join("home"),
         }
     }
 
@@ -304,6 +305,7 @@ bypass = true
         let paths = Paths {
             config_dir: temp.path().join("config"),
             state_dir: PathBuf::from(OsString::from_vec(vec![b'/', b't', b'm', b'p', b'/', 0xff])),
+            home_dir: temp.path().join("home"),
         };
         write_config(
             &paths,

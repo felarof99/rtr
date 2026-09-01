@@ -986,6 +986,7 @@ mod tests {
         Paths {
             config_dir: root.join("config"),
             state_dir: root.join("state"),
+            home_dir: root.join("home"),
         }
     }
 

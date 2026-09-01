@@ -404,6 +404,7 @@ mod tests {
         let paths = Paths {
             config_dir: dir.path().join("cfg"),
             state_dir: dir.path().join("state"),
+            home_dir: dir.path().join("home"),
         };
         let mut state = State::default();
         state.set_current_profile("claude", "nit");
