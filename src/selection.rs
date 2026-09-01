@@ -161,6 +161,7 @@ mod tests {
             args: Vec::new(),
             skills_source: None,
             copy: None,
+            inherit_mcp: true,
             profiles: names
                 .iter()
                 .map(|name| ((*name).to_string(), Profile::default()))

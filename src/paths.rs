@@ -97,6 +97,12 @@ fn ensure_private_descendant_dir(root: &Path, segments: &[&str]) -> Result<PathB
 pub struct Paths {
     pub config_dir: PathBuf,
     pub state_dir: PathBuf,
+    /// The user's home directory, the root every "main" tool config hangs off.
+    ///
+    /// Carried here rather than re-read from `HOME` at each use so that tests
+    /// can point inheritance at a temp home without mutating process
+    /// environment shared by parallel tests.
+    pub home_dir: PathBuf,
 }
 
 /// Resolve a base directory: an explicit override wins, else `home` joined with
@@ -132,7 +138,17 @@ impl Paths {
         Ok(Self {
             config_dir,
             state_dir,
+            home_dir: home,
         })
+    }
+
+    /// Absolute path to one tool's main (non-rtr) config file.
+    pub fn main_tool_config(&self, spec: &crate::tool_specs::ToolSpec) -> PathBuf {
+        let mut path = self.home_dir.clone();
+        for segment in spec.main_config_rel {
+            path.push(segment);
+        }
+        path
     }
 
     pub fn config_file(&self) -> PathBuf {
@@ -252,6 +268,7 @@ mod tests {
         let p = Paths {
             config_dir: PathBuf::from("/c"),
             state_dir: PathBuf::from("/s"),
+            home_dir: PathBuf::from("/h"),
         };
         assert_eq!(p.config_file(), PathBuf::from("/c/config.toml"));
         assert_eq!(p.state_file(), PathBuf::from("/s/state.toml"));
@@ -264,6 +281,7 @@ mod tests {
         let p = Paths {
             config_dir: PathBuf::from("/c"),
             state_dir: PathBuf::from("/s"),
+            home_dir: PathBuf::from("/h"),
         };
         assert_eq!(
             p.profile_home_dir("codex", "personal"),
@@ -276,6 +294,7 @@ mod tests {
         let p = Paths {
             config_dir: PathBuf::from("/c"),
             state_dir: PathBuf::from("/s"),
+            home_dir: PathBuf::from("/h"),
         };
 
         assert_eq!(
@@ -307,6 +326,7 @@ mod tests {
         let p = Paths {
             config_dir: PathBuf::from("/c"),
             state_dir: PathBuf::from("/s"),
+            home_dir: PathBuf::from("/h"),
         };
         assert_eq!(
             p.profile_home_dir("claude", "work/team"),
@@ -354,6 +374,7 @@ mod tests {
         let paths = Paths {
             config_dir: dir.path().join("config"),
             state_dir: dir.path().join("state"),
+            home_dir: dir.path().join("home"),
         };
         let selected = paths
             .ensure_profile_home_dir("codex", "../personal")
@@ -380,6 +401,7 @@ mod tests {
             let paths = Paths {
                 config_dir: dir.path().join("config"),
                 state_dir: dir.path().join("state"),
+                home_dir: dir.path().join("home"),
             };
             paths.ensure_profile_home_dir("codex", "seed").unwrap();
             let external = dir.path().join("external");
@@ -429,6 +451,7 @@ mod tests {
             let p = Paths {
                 config_dir: dir.path().join("config"),
                 state_dir: dir.path().join("state"),
+                home_dir: dir.path().join("home"),
             };
             std::fs::create_dir_all(p.homes_dir()).unwrap();
             let target = dir.path().join("target");

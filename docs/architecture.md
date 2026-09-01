@@ -11,10 +11,11 @@
 | `conversation_transfer` | Independent native history copies, format adapters, asset relocation, and exclusive publication |
 | `conversation_command` | Human/JSON rendering and direct-open versus picker dispatch |
 | `picker` | Terminal input/layout, background dialogue search, preview excerpts, and launch descriptions |
-| `tool_specs` | Native-home variables and skills relocation policy per tool |
+| `tool_specs` | Native-home variables and skills relocation policy, and main-config MCP location per tool |
 | `selection` | Exact percentage allocation, enabled-profile validation, and equal/weighted rotation |
-| `state` | Locked, atomic rotation cursor and weighted score persistence |
+| `state` | Locked, atomic rotation cursor and weighted score and switched profile persistence |
 | `weights` | Percentage CLI transactions and shared allocation presentation |
+| `inherit` | Provenance-tracked one-way sync of shared MCP servers from each tool's main config into a profile home |
 | `paths` | Config/state resolution, private directories, safe profile paths |
 | `runner` | Profile creation/repair, native-home preparation, skills refresh, direct child execution |
 | `profiles` | Profile show/status, policy changes, and confirmed exact-home removal |
@@ -33,6 +34,7 @@ CLI
      ├─ selection::select_profile
      ├─ Paths::ensure_profile_home_dir
      ├─ sync_profile_skills
+     ├─ inherit::sync_profile_best_effort
      ├─ tokio::process::Command::spawn + signal-aware wait
      └─ usage::append_event
 ```
@@ -137,9 +139,16 @@ The child inherits stdio and its numeric exit status. rtr forwards SIGINT,
 SIGTERM, SIGHUP, and SIGQUIT received while waiting. On Unix, signal exits use
 the shell convention `128 + signal`.
 
+`prepare_native_profile_env` is the single point both launch and `switch` reach
+a profile home through, so MCP inheritance is wired there once and applies to
+launches, `fix`, exact resume/fork, and `switch` alike. It runs after the
+startup copy, so a `copy` mapping that ships a config file counts as the
+profile's own content. Bypassed launches skip it with the rest of preparation.
+
 Claude receives `CLAUDE_CONFIG_DIR` and
-`CLAUDE_SECURESTORAGE_CONFIG_DIR` set to the same home. Only `skills/` is seeded;
-settings, commands, agents, plugins, auth state, and sessions remain owned by
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` set to the same home. Only `skills/` and the
+`mcpServers` object of `.claude.json` are seeded; the rest of that file, plus
+settings, commands, agents, plugins, auth state, and sessions, remain owned by
 that profile, while project `.claude/*` discovery remains rooted in the working
 tree.
 
@@ -157,7 +166,9 @@ $RTR_CONFIG_DIR/
 $RTR_STATE_DIR/
 ├── homes/
 │   ├── claude/<profile>/      # config and secure-storage namespace
+│   │   └── .rtr-inherited.json
 │   └── codex/<profile>/
+│       └── .rtr-inherited.json
 ├── state.toml
 └── usage.jsonl
 ```
@@ -176,6 +187,11 @@ Recursive removal rejects symlinked path components instead of following them.
 - Repair removes only the selected Codex home's `auth.json.lock`; it does not
   delete `auth.json`, sessions, general runtime locks, or sibling profile data.
 - Skills refresh errors preserve the previous destination.
+- MCP inheritance is best-effort: a missing main config is skipped silently and
+  a malformed one warns without failing the launch. It only ever writes the MCP
+  section, only replaces entries whose recorded fingerprint still matches, and
+  treats unreadable provenance as "nothing here is ours", so the failure
+  direction is a missed update rather than a lost profile edit.
 - Automatic cursor updates are not saved after preflight errors.
 - Spawn errors are returned with executable context and recorded without an
   exit code.
@@ -190,10 +206,14 @@ Recursive removal rejects symlinked path components instead of following them.
 ## Test Boundaries
 
 Unit tests cover strict schemas, path encoding, locks, selection, skills copy,
-Claude/Codex symlink policies, profile rendering, and statistics.
+Claude/Codex symlink policies, profile rendering, statistics, and the MCP
+inherit algorithm (injection, update, profile-edit precedence, retraction,
+idempotency, damaged inputs, and the opt-out).
+`Paths` carries the user home so inheritance reads a temp main config in tests
+instead of the real one.
 `tests/run_smoke.rs` launches real shell
 children to verify environment, argument order, skills refresh, cursor
 behavior, exact-home removal, config editor status, repair isolation, exit
 mapping, error recording, real PTY picker key semantics and terminal restoration,
-exact archived-profile opens, and
+exact archived-profile opens, MCP inheritance on launch and switch paths, and
 absence of extra run artifacts.

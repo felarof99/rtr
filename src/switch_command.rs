@@ -159,6 +159,7 @@ mod tests {
         let paths = Paths {
             config_dir: dir.path().join("cfg"),
             state_dir: dir.path().join("state"),
+            home_dir: dir.path().join("home"),
         };
         let error = print_shell_init(&paths, "fish").unwrap_err().to_string();
         assert!(error.contains("unsupported shell 'fish'"), "{error}");
@@ -170,6 +171,7 @@ mod tests {
         let paths = Paths {
             config_dir: dir.path().join("cfg"),
             state_dir: dir.path().join("state"),
+            home_dir: dir.path().join("home"),
         };
         State::update_locked(&paths.state_file(), |state| {
             state.set_current_profile("codex", "eng");

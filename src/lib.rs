@@ -8,6 +8,7 @@ mod conversation_transfer;
 pub mod conversations;
 mod file_lock;
 pub mod output;
+pub mod inherit;
 pub mod paths;
 mod picker;
 mod profile_overview;
