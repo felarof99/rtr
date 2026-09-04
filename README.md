@@ -122,9 +122,12 @@ rtr sessions
 The picker searches the complete user/assistant dialogue plus native names,
 first prompts, working directories, tools, profiles, and IDs. `Enter` forks the
 selected conversation, `Ctrl-R` resumes it in place, and `Ctrl-F` explicitly
-forks it. A right-side transcript preview moves below the list on narrow
-terminals; `Ctrl-U` / `Ctrl-D` scroll it and `Alt-P` toggles it. Preview remains
-a bounded tail of the selected session so moving through results stays fast.
+forks it. Fork follows the profile selected by `rtr switch`; use `--into <profile>`
+to override it. RTR stages the native session in that profile, while resume
+always stays with the owner. A right-side transcript preview moves below the
+list on narrow terminals; `Ctrl-U` / `Ctrl-D` scroll it and `Alt-P` toggles it.
+Preview remains a bounded tail of the selected session so moving through results
+stays fast.
 
 Open an exact native ID or exact native name directly:
 
@@ -133,11 +136,12 @@ rtr resume <session-id-or-name>
 rtr fork <session-id-or-name>
 ```
 
-Use `--tool`, `--profile`, or `--here` to narrow either command. Exact opens
-always use the isolated profile that owns the session, even when that profile
-is disabled or normally bypassed; they do not change rotation state. Use
-`rtr sessions --list` or `--json` for scripts, and keep `rtr here` as the compact
-five-row current-directory view.
+Use `--tool`, `--profile`, or `--here` to narrow either command. Resume and
+same-profile fork keep using the isolated owner even when it is disabled or
+normally bypassed; they do not change rotation state. A cross-profile fork
+requires an enabled, non-bypassed destination. Use `rtr sessions --list` or
+`--json` for scripts, and keep `rtr here` as the compact five-row
+current-directory view.
 
 Rename the active conversation with the native `/rename` command in either
 Claude Code or Codex. RTR reads those native names rather than maintaining a
@@ -160,12 +164,12 @@ rtr disable <claude|codex> --profile <name>
 rtr bypass <claude|codex> --profile <name>
 rtr unbypass <claude|codex> --profile <name>
 rtr paths [--json]
-rtr sessions [--tool <claude|codex>] [-p|--profile <name>] [--here]
+rtr sessions [--tool <claude|codex>] [-p|--profile <name>] [--into <name>] [--here]
              [-q|--query <text>] [--list|--json]
 rtr resume [session-id-or-name] [--tool <claude|codex>]
            [-p|--profile <name>] [--here] [-- native args...]
 rtr fork [session-id-or-name] [--tool <claude|codex>]
-         [-p|--profile <name>] [--here] [-- native args...]
+         [-p|--profile <name>] [--into <name>] [--here] [-- native args...]
 rtr here
 rtr ls
 rtr show <claude|codex> --profile <name>

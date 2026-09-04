@@ -173,6 +173,8 @@ pub fn query(paths: &Paths, query: &ConversationQuery) -> Result<Catalog> {
             let home = paths.profile_home_dir(tool_name, profile_name);
             let result = match tool_name.as_str() {
                 "codex" => scan_codex_home(
+                    paths,
+                    &config,
                     &home,
                     profile_name,
                     profile.enabled,
@@ -180,6 +182,8 @@ pub fn query(paths: &Paths, query: &ConversationQuery) -> Result<Catalog> {
                     &mut catalog,
                 ),
                 "claude" => scan_claude_home(
+                    paths,
+                    &config,
                     &home,
                     profile_name,
                     profile.enabled,
@@ -337,12 +341,174 @@ pub fn matches_selector<'a>(catalog: &'a Catalog, selector: &str) -> Result<Vec<
         .collect())
 }
 
-/// Resume or fork an exact native conversation in the profile that owns it.
+fn origin_marker(transcript: &Path) -> PathBuf {
+    let mut marker = transcript.as_os_str().to_os_string();
+    marker.push(".rtr-origin");
+    PathBuf::from(marker)
+}
+
+fn stage_into_profile(
+    paths: &Paths,
+    conversation: &Conversation,
+    target_profile: &str,
+) -> Result<()> {
+    if target_profile == conversation.profile {
+        return Ok(());
+    }
+    if !matches!(conversation.tool.as_str(), "claude" | "codex") {
+        anyhow::bail!("unsupported conversation tool '{}'", conversation.tool);
+    }
+
+    let source_home = paths.profile_home_dir(&conversation.tool, &conversation.profile);
+    let relative_transcript = conversation
+        .transcript_path
+        .strip_prefix(&source_home)
+        .with_context(|| {
+            format!(
+                "conversation transcript {} is outside its owning home {}",
+                conversation.transcript_path.display(),
+                source_home.display()
+            )
+        })?;
+    let target_home = paths.ensure_profile_home_dir(&conversation.tool, target_profile)?;
+    let target_transcript = target_home.join(relative_transcript);
+    let marker = origin_marker(&target_transcript);
+
+    if target_transcript.exists() && !marker.is_file() {
+        anyhow::bail!(
+            "session {} already exists natively in {}/{}",
+            conversation.id,
+            conversation.tool,
+            target_profile
+        );
+    }
+
+    match conversation.tool.as_str() {
+        "claude" => {
+            copy_file(&conversation.transcript_path, &target_transcript)?;
+            for source in [
+                conversation.transcript_path.with_extension(""),
+                source_home.join("session-env").join(&conversation.id),
+            ] {
+                if source.exists() {
+                    let relative = source.strip_prefix(&source_home).with_context(|| {
+                        format!("{} is outside {}", source.display(), source_home.display())
+                    })?;
+                    copy_path(&source, &target_home.join(relative))?;
+                }
+            }
+        }
+        "codex" => {
+            copy_file(&conversation.transcript_path, &target_transcript)?;
+            stage_codex_name(&source_home, &target_home, &conversation.id)?;
+        }
+        _ => unreachable!(),
+    }
+
+    crate::file_lock::write_private_atomic(
+        &marker,
+        &format!("{}/{}\n", conversation.tool, conversation.profile),
+    )?;
+    Ok(())
+}
+
+fn copy_path(source: &Path, target: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(source)
+        .with_context(|| format!("reading metadata for {}", source.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("refusing to stage symlink {}", source.display());
+    }
+    if metadata.is_file() {
+        return copy_file(source, target);
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!("cannot stage non-file {}", source.display());
+    }
+
+    crate::paths::create_private_dir_all(target)?;
+    for entry in
+        std::fs::read_dir(source).with_context(|| format!("reading {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading {}", source.display()))?;
+        copy_path(&entry.path(), &target.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn copy_file(source: &Path, target: &Path) -> Result<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(target) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            anyhow::bail!("refusing to overwrite non-file {}", target.display());
+        }
+    }
+    if let Some(parent) = target.parent() {
+        crate::paths::create_private_dir_all(parent)?;
+    }
+    std::fs::copy(source, target)
+        .with_context(|| format!("copying {} to {}", source.display(), target.display()))?;
+    Ok(())
+}
+
+fn stage_codex_name(source_home: &Path, target_home: &Path, id: &str) -> Result<()> {
+    let source_index = source_home.join("session_index.jsonl");
+    let Some(source_line) = index_line(&source_index, id)? else {
+        return Ok(());
+    };
+    let target_index = target_home.join("session_index.jsonl");
+    let lock = crate::file_lock::lock_path(&target_index);
+    crate::file_lock::with_exclusive_lock(&lock, || {
+        let mut contents = match std::fs::read_to_string(&target_index) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", target_index.display()));
+            }
+        };
+        if index_contains(&contents, id) {
+            return Ok(());
+        }
+        if !contents.is_empty() && !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        contents.push_str(&source_line);
+        contents.push('\n');
+        crate::file_lock::write_private_atomic(&target_index, &contents)
+    })
+}
+
+fn index_line(path: &Path, id: &str) -> Result<Option<String>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
+    };
+    for line in BufReader::new(file).lines() {
+        let line = line.with_context(|| format!("reading {}", path.display()))?;
+        if json_line_has_id(&line, id) {
+            return Ok(Some(line));
+        }
+    }
+    Ok(None)
+}
+
+fn index_contains(contents: &str, id: &str) -> bool {
+    contents.lines().any(|line| json_line_has_id(line, id))
+}
+
+fn json_line_has_id(line: &str, id: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|record| record.get("id").and_then(Value::as_str).map(str::to_string))
+        .is_some_and(|found| found == id)
+}
+
+/// Resume an exact conversation with its owner, or fork it into a selected profile.
 pub async fn open(
     paths: &Paths,
     conversation: &Conversation,
     mode: OpenMode,
     extra_args: &[String],
+    target_profile: Option<&str>,
 ) -> Result<i32> {
     if !conversation.transcript_path.is_file() {
         anyhow::bail!(
@@ -350,12 +516,27 @@ pub async fn open(
             conversation.transcript_path.display()
         );
     }
+    let launch_profile = match (mode, target_profile) {
+        (OpenMode::Fork, Some(target)) => target,
+        _ => &conversation.profile,
+    };
+    if mode == OpenMode::Fork && launch_profile != conversation.profile {
+        stage_into_profile(paths, conversation, launch_profile)?;
+        eprintln!(
+            "rtr: forking {}/{} session {} into {}/{}",
+            conversation.tool,
+            conversation.profile,
+            conversation.id,
+            conversation.tool,
+            launch_profile
+        );
+    }
     let mut args = native_open_args(&conversation.tool, &conversation.id, mode)?;
     args.extend_from_slice(extra_args);
     crate::runner::run_isolated_profile_tool(
         paths,
         &conversation.tool,
-        &conversation.profile,
+        launch_profile,
         &args,
         Some(&conversation.cwd),
     )
@@ -374,6 +555,8 @@ fn native_open_args(tool: &str, id: &str, mode: OpenMode) -> Result<Vec<String>>
 }
 
 fn scan_codex_home(
+    paths: &Paths,
+    config: &Config,
     home: &Path,
     profile: &str,
     enabled: bool,
@@ -384,6 +567,13 @@ fn scan_codex_home(
     let names = codex_names(&home.join("session_index.jsonl"), &mut catalog.diagnostics)?;
     let mut seen_ids = HashSet::new();
     for path in codex_transcript_files(home)? {
+        match staged_copy_is_shadow(paths, config, "codex", profile, home, &path) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => catalog
+                .diagnostics
+                .push(format!("{}: {error:#}", origin_marker(&path).display())),
+        }
         match codex_conversation(&path, profile, enabled, bypass, &prompts, &names) {
             Ok(Some(conversation)) if seen_ids.insert(conversation.id.clone()) => {
                 catalog.conversations.push(conversation)
@@ -496,6 +686,8 @@ fn codex_conversation(
 }
 
 fn scan_claude_home(
+    paths: &Paths,
+    config: &Config,
     home: &Path,
     profile: &str,
     enabled: bool,
@@ -504,6 +696,13 @@ fn scan_claude_home(
 ) -> Result<()> {
     for project in directories_if_exists(&home.join("projects"))? {
         for path in jsonl_files(&project)? {
+            match staged_copy_is_shadow(paths, config, "claude", profile, home, &path) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => catalog
+                    .diagnostics
+                    .push(format!("{}: {error:#}", origin_marker(&path).display())),
+            }
             match claude_conversation(&path, profile, enabled, bypass) {
                 Ok(Some(conversation)) => catalog.conversations.push(conversation),
                 Ok(None) => catalog
@@ -516,6 +715,50 @@ fn scan_claude_home(
         }
     }
     Ok(())
+}
+
+fn staged_copy_is_shadow(
+    paths: &Paths,
+    config: &Config,
+    tool: &str,
+    profile: &str,
+    home: &Path,
+    transcript: &Path,
+) -> Result<bool> {
+    let marker = origin_marker(transcript);
+    let contents = match std::fs::read_to_string(&marker) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", marker.display())),
+    };
+    let Some(origin) = contents
+        .strip_suffix('\n')
+        .and_then(|value| value.strip_prefix(&format!("{tool}/")))
+    else {
+        return Ok(false);
+    };
+    if origin.is_empty()
+        || origin == profile
+        || origin
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n'))
+    {
+        return Ok(false);
+    }
+    let origin_is_configured = config
+        .tools
+        .get(tool)
+        .is_some_and(|configured_tool| configured_tool.profiles.contains_key(origin));
+    if !origin_is_configured {
+        return Ok(false);
+    }
+    let relative = transcript
+        .strip_prefix(home)
+        .with_context(|| format!("{} is outside {}", transcript.display(), home.display()))?;
+    Ok(paths
+        .profile_home_dir(tool, origin)
+        .join(relative)
+        .is_file())
 }
 
 fn claude_conversation(
@@ -1143,6 +1386,208 @@ command = ["claude"]
             native_open_args("claude", "session", OpenMode::Fork).unwrap(),
             ["--resume", "session", "--fork-session"]
         );
+    }
+
+    #[test]
+    fn tests_that_claude_staging_copies_the_native_bundle_and_marks_its_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let id = "claude-session";
+        let source_home = paths.profile_home_dir("claude", "eng");
+        let transcript = source_home
+            .join("projects/-work-project")
+            .join(format!("{id}.jsonl"));
+        let support_file = transcript
+            .with_extension("")
+            .join("tool-results/result.txt");
+        let env_file = source_home.join("session-env").join(id).join("env.txt");
+        fs::create_dir_all(support_file.parent().unwrap()).unwrap();
+        fs::create_dir_all(env_file.parent().unwrap()).unwrap();
+        fs::write(&transcript, "source transcript").unwrap();
+        fs::write(&support_file, "tool result").unwrap();
+        fs::write(&env_file, "export TOKEN=test").unwrap();
+        let mut conversation = test_conversation("claude", "eng", id, "title");
+        conversation.transcript_path = transcript;
+
+        stage_into_profile(&paths, &conversation, "nit").unwrap();
+
+        let target_home = paths.profile_home_dir("claude", "nit");
+        let target = target_home
+            .join("projects/-work-project")
+            .join(format!("{id}.jsonl"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "source transcript");
+        assert_eq!(
+            fs::read_to_string(target.with_extension("").join("tool-results/result.txt")).unwrap(),
+            "tool result"
+        );
+        assert_eq!(
+            fs::read_to_string(target_home.join("session-env").join(id).join("env.txt")).unwrap(),
+            "export TOKEN=test"
+        );
+        assert_eq!(
+            fs::read_to_string(origin_marker(&target)).unwrap(),
+            "claude/eng\n"
+        );
+    }
+
+    #[test]
+    fn tests_that_codex_staging_copies_the_rollout_and_one_native_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let id = "codex-session";
+        let source_home = paths.profile_home_dir("codex", "eng");
+        let transcript = source_home
+            .join("sessions/2026/09/04")
+            .join(format!("rollout-now-{id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "source rollout").unwrap();
+        fs::write(
+            source_home.join("session_index.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"id": "other", "thread_name": "Other"}),
+                serde_json::json!({"id": id, "thread_name": "Native name"})
+            ),
+        )
+        .unwrap();
+        fs::write(source_home.join("history.jsonl"), "private history").unwrap();
+        let mut conversation = test_conversation("codex", "eng", id, "title");
+        conversation.transcript_path = transcript;
+
+        stage_into_profile(&paths, &conversation, "nit").unwrap();
+        stage_into_profile(&paths, &conversation, "nit").unwrap();
+
+        let target_home = paths.profile_home_dir("codex", "nit");
+        let target = target_home
+            .join("sessions/2026/09/04")
+            .join(format!("rollout-now-{id}.jsonl"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "source rollout");
+        let index = fs::read_to_string(target_home.join("session_index.jsonl")).unwrap();
+        assert_eq!(index.matches(id).count(), 1, "{index}");
+        assert!(!target_home.join("history.jsonl").exists());
+        assert_eq!(
+            fs::read_to_string(origin_marker(&target)).unwrap(),
+            "codex/eng\n"
+        );
+    }
+
+    #[test]
+    fn tests_that_staging_rejects_a_native_target_without_overwriting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        let id = "collision-session";
+        let source_home = paths.profile_home_dir("claude", "eng");
+        let relative = Path::new("projects/-work").join(format!("{id}.jsonl"));
+        let transcript = source_home.join(&relative);
+        let target = paths.profile_home_dir("claude", "nit").join(&relative);
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&transcript, "source").unwrap();
+        fs::write(&target, "native target").unwrap();
+        let mut conversation = test_conversation("claude", "eng", id, "title");
+        conversation.transcript_path = transcript;
+
+        let error = stage_into_profile(&paths, &conversation, "nit")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("session collision-session already exists natively in claude/nit"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(target).unwrap(), "native target");
+    }
+
+    #[test]
+    fn tests_that_a_staged_claude_copy_is_hidden_until_its_origin_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.config_file(),
+            r#"
+[tools.claude]
+command = ["claude"]
+[tools.claude.profiles.eng]
+[tools.claude.profiles.nit]
+"#,
+        )
+        .unwrap();
+        let id = "claude-dedupe";
+        let transcript = paths
+            .profile_home_dir("claude", "eng")
+            .join("projects/-work")
+            .join(format!("{id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            serde_json::json!({
+                "type": "user", "sessionId": id, "cwd": "/work",
+                "timestamp": "2026-09-04T10:00:00Z",
+                "message": {"content": "hello"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut conversation = test_conversation("claude", "eng", id, "title");
+        conversation.transcript_path = transcript.clone();
+        stage_into_profile(&paths, &conversation, "nit").unwrap();
+
+        let catalog = query(&paths, &ConversationQuery::all()).unwrap();
+        assert_eq!(catalog.conversations.len(), 1);
+        assert_eq!(catalog.conversations[0].profile, "eng");
+
+        fs::remove_file(transcript).unwrap();
+        let catalog = query(&paths, &ConversationQuery::all()).unwrap();
+        assert_eq!(catalog.conversations.len(), 1);
+        assert_eq!(catalog.conversations[0].profile, "nit");
+    }
+
+    #[test]
+    fn tests_that_a_staged_codex_copy_is_hidden_until_its_origin_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            paths.config_file(),
+            r#"
+[tools.codex]
+command = ["codex"]
+[tools.codex.profiles.eng]
+[tools.codex.profiles.nit]
+"#,
+        )
+        .unwrap();
+        let id = "codex-dedupe";
+        let transcript = paths
+            .profile_home_dir("codex", "eng")
+            .join("sessions/2026/09/04")
+            .join(format!("rollout-now-{id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": id, "cwd": "/work",
+                    "timestamp": "2026-09-04T10:00:00Z"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut conversation = test_conversation("codex", "eng", id, "title");
+        conversation.transcript_path = transcript.clone();
+        stage_into_profile(&paths, &conversation, "nit").unwrap();
+
+        let catalog = query(&paths, &ConversationQuery::all()).unwrap();
+        assert_eq!(catalog.conversations.len(), 1);
+        assert_eq!(catalog.conversations[0].profile, "eng");
+
+        fs::remove_file(transcript).unwrap();
+        let catalog = query(&paths, &ConversationQuery::all()).unwrap();
+        assert_eq!(catalog.conversations.len(), 1);
+        assert_eq!(catalog.conversations[0].profile, "nit");
     }
 
     #[test]

@@ -276,6 +276,180 @@ bypass = true
 }
 
 #[test]
+fn tests_that_fork_stages_and_launches_in_the_switched_claude_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let project = temp.path().join("recorded-project");
+    let launch = temp.path().join("fork-launch.txt");
+    let id = "cross-profile-session";
+    let relative = Path::new("projects/-recorded-project").join(format!("{id}.jsonl"));
+    let source = paths.profile_home_dir("claude", "eng").join(&relative);
+    let target = paths.profile_home_dir("claude", "nit").join(&relative);
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let transcript = format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user", "sessionId": id, "cwd": project,
+            "timestamp": "2026-09-04T10:00:00Z",
+            "message": {"content": "continue this"}
+        })
+    );
+    std::fs::write(&source, &transcript).unwrap();
+    write_config(
+        &paths,
+        &format!(
+            r#"
+[tools.claude]
+command = ["sh", "-c", {}, "runner", {}, {}]
+copy = []
+[tools.claude.profiles.eng]
+[tools.claude.profiles.nit]
+"#,
+            toml::Value::String(
+                "launch=$1; staged=$2; shift 2; test -f \"$staged\" || exit 41; printf 'config=%s\\nsecure=%s\\ncwd=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$CLAUDE_SECURESTORAGE_CONFIG_DIR\" \"$PWD\" > \"$launch\"; printf '%s\\n' \"$@\" >> \"$launch\"".into()
+            ),
+            toml_path(&launch),
+            toml_path(&target)
+        ),
+    );
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rtr"))
+        .args(["fork", id, "--tool", "claude"])
+        .env("HOME", temp.path())
+        .env("RTR_CONFIG_DIR", &paths.config_dir)
+        .env("RTR_STATE_DIR", &paths.state_dir)
+        .env("RTR_PROFILE_CLAUDE", "nit")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let target_home = paths.profile_home_dir("claude", "nit");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), transcript);
+    assert_eq!(
+        std::fs::read_to_string(format!("{}.rtr-origin", target.display())).unwrap(),
+        "claude/eng\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(launch).unwrap(),
+        format!(
+            "config={}\nsecure={}\ncwd={}\n--resume\n{}\n--fork-session\n",
+            target_home.display(),
+            target_home.display(),
+            project.canonicalize().unwrap().display(),
+            id
+        )
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "rtr: forking claude/eng session {id} into claude/nit"
+        )),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("rtr: claude ran in profile 'nit'"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn tests_that_resume_stays_with_its_owner_and_hints_about_the_switch() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+    let project = temp.path().join("recorded-project");
+    let launch = temp.path().join("resume-launch.txt");
+    let id = "owner-session";
+    let transcript = paths
+        .profile_home_dir("claude", "eng")
+        .join("projects/-recorded-project")
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user", "sessionId": id, "cwd": project,
+                "timestamp": "2026-09-04T10:00:00Z",
+                "message": {"content": "resume this"}
+            })
+        ),
+    )
+    .unwrap();
+    write_config(
+        &paths,
+        &format!(
+            r#"
+[tools.claude]
+command = ["sh", "-c", {}, "runner", {}]
+copy = []
+[tools.claude.profiles.eng]
+[tools.claude.profiles.nit]
+"#,
+            toml::Value::String(
+                "launch=$1; shift; printf 'config=%s\\ncwd=%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$PWD\" > \"$launch\"; printf '%s\\n' \"$@\" >> \"$launch\"".into()
+            ),
+            toml_path(&launch)
+        ),
+    );
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rtr"))
+        .args(["resume", id, "--tool", "claude"])
+        .env("HOME", temp.path())
+        .env("RTR_CONFIG_DIR", &paths.config_dir)
+        .env("RTR_STATE_DIR", &paths.state_dir)
+        .env("RTR_PROFILE_CLAUDE", "nit")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let owner_home = paths.profile_home_dir("claude", "eng");
+    assert_eq!(
+        std::fs::read_to_string(launch).unwrap(),
+        format!(
+            "config={}\ncwd={}\n--resume\n{}\n",
+            owner_home.display(),
+            project.canonicalize().unwrap().display(),
+            id
+        )
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "rtr: resuming in claude/eng (owner); shell is switched to nit — use rtr fork to continue there"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("rtr: claude ran in profile 'eng'"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn tests_that_resume_rejects_a_fork_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = test_paths(temp.path());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rtr"))
+        .args(["resume", "session", "--into", "nit"])
+        .env("HOME", temp.path())
+        .env("RTR_CONFIG_DIR", &paths.config_dir)
+        .env("RTR_STATE_DIR", &paths.state_dir)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--into is only valid for forks"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn sessions_json_exposes_versioned_cross_profile_identity_and_native_title() {
     let temp = tempfile::tempdir().unwrap();
     let paths = test_paths(temp.path());
@@ -386,6 +560,7 @@ bypass = true
         .env("HOME", temp.path())
         .env("RTR_CONFIG_DIR", &paths.config_dir)
         .env("RTR_STATE_DIR", &paths.state_dir)
+        .env_remove("RTR_PROFILE_CODEX")
         .output()
         .unwrap();
     assert!(direct.status.success(), "{direct:?}");
@@ -413,6 +588,7 @@ bypass = true
         .env("RTR_STATE_DIR", &paths.state_dir)
         .env("RTR_FZF", &fake_fzf)
         .env("RTR_TEST_FZF_KEY", "ctrl-r")
+        .env_remove("RTR_PROFILE_CODEX")
         .output()
         .unwrap();
     assert!(picked.status.success(), "{picked:?}");
@@ -429,6 +605,7 @@ bypass = true
         .env("RTR_CONFIG_DIR", &paths.config_dir)
         .env("RTR_STATE_DIR", &paths.state_dir)
         .env("RTR_FZF", &fake_fzf)
+        .env_remove("RTR_PROFILE_CODEX")
         .output()
         .unwrap();
     assert!(
