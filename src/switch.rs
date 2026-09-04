@@ -9,6 +9,8 @@
 //! The persisted selection lives in `state.toml` next to the rotation cursors
 //! so a new shell can adopt the last switch without re-running preparation.
 
+use std::ffi::OsString;
+
 use anyhow::{bail, Context, Result};
 
 use crate::config::{Config, Tool};
@@ -21,8 +23,54 @@ use crate::tool_specs;
 ///
 /// Exported alongside the native home so a prompt or status line can show the
 /// current identity without shelling out to rtr.
-fn profile_label_env(tool: &str) -> String {
+pub(crate) fn profile_label_env(tool: &str) -> String {
     format!("RTR_PROFILE_{}", tool.to_uppercase())
+}
+
+/// Return the per-shell switch, then the persisted switch when no shell label exists.
+pub(crate) fn active_profile(paths: &Paths, tool: &str) -> Result<Option<String>> {
+    active_profile_with(paths, tool, std::env::var_os(profile_label_env(tool)))
+}
+
+fn active_profile_with(
+    paths: &Paths,
+    tool: &str,
+    shell_profile: Option<OsString>,
+) -> Result<Option<String>> {
+    if let Some(profile) = shell_profile {
+        return profile
+            .into_string()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8", profile_label_env(tool)));
+    }
+
+    Ok(State::load(&paths.state_file())?
+        .current_profile(tool)
+        .map(str::to_string))
+}
+
+/// Ensure a fork destination has a usable isolated home.
+pub(crate) fn validate_profile(config: &Config, tool: &str, profile: &str) -> Result<()> {
+    let spec = tool_specs::get(tool)?;
+    let selector = SwitchSelector {
+        tool: Some(spec.name.to_string()),
+        profile: profile.to_string(),
+        command: Vec::new(),
+    };
+    let Some(configured) = config
+        .tools
+        .get(spec.name)
+        .and_then(|configured_tool| configured_tool.profiles.get(profile))
+    else {
+        return Err(no_target_error(config, &selector, &[], &[]));
+    };
+    if !configured.enabled {
+        return Err(no_target_error(config, &selector, &[spec.name], &[]));
+    }
+    if configured.bypass {
+        return Err(no_target_error(config, &selector, &[], &[spec.name]));
+    }
+    Ok(())
 }
 
 /// One tool's resolved switch target.
@@ -287,6 +335,8 @@ pub fn render_restore(paths: &Paths, state: &State) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
 
     fn v(items: &[&str]) -> Vec<String> {
@@ -429,5 +479,74 @@ mod tests {
         );
         // Codex was never switched, so it must not leak into the shell.
         assert!(!rendered.contains("CODEX_HOME"), "{rendered}");
+    }
+
+    #[test]
+    fn tests_that_shell_profile_precedes_persisted_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            state_dir: dir.path().join("state"),
+            home_dir: dir.path().join("home"),
+        };
+        State::update_locked(&paths.state_file(), |state| {
+            state.set_current_profile("claude", "persisted");
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            active_profile_with(&paths, "claude", Some(OsString::from("shell"))).unwrap(),
+            Some("shell".to_string())
+        );
+    }
+
+    #[test]
+    fn tests_that_persisted_profile_is_used_without_a_shell_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: dir.path().join("cfg"),
+            state_dir: dir.path().join("state"),
+            home_dir: dir.path().join("home"),
+        };
+        State::update_locked(&paths.state_file(), |state| {
+            state.set_current_profile("codex", "persisted");
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            active_profile_with(&paths, "codex", None).unwrap(),
+            Some("persisted".to_string())
+        );
+        assert_eq!(active_profile_with(&paths, "claude", None).unwrap(), None);
+    }
+
+    #[test]
+    fn tests_that_unusable_fork_targets_are_rejected() {
+        let config = Config::parse(
+            r#"
+[tools.claude]
+command = ["claude"]
+[tools.claude.profiles.ready]
+[tools.claude.profiles.disabled]
+enabled = false
+[tools.claude.profiles.bypassed]
+bypass = true
+"#,
+        )
+        .unwrap();
+
+        validate_profile(&config, "claude", "ready").unwrap();
+        for (profile, expected) in [
+            ("disabled", "profile 'disabled' is disabled for claude"),
+            ("bypassed", "profile 'bypassed' is bypassed for claude"),
+            ("missing", "no profile 'missing' is configured"),
+        ] {
+            let error = validate_profile(&config, "claude", profile)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 }

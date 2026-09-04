@@ -205,13 +205,14 @@ machine-readable v1 contract; human output is for inspection only.")]
 Search Claude Code and Codex conversations across every configured native home.
 
 The interactive picker searches the complete user/assistant dialogue as well as
-titles, prompts, paths, tools, profiles, and native IDs. Enter forks the selected
-conversation; Ctrl-R resumes it in place. Use --list or --json for
-non-interactive output.")]
+titles, prompts, paths, tools, profiles, and native IDs. Enter forks into --into,
+the active switched profile, or the owner in that order; Ctrl-R resumes with the
+owner. Use --list or --json for non-interactive output.")]
     Sessions(SessionsArgs),
     /// Fork an exact native conversation, or choose one interactively.
     #[command(long_about = "\
-Fork a native Claude Code or Codex conversation in the isolated profile that
+Fork a native Claude Code or Codex conversation into --into when supplied,
+otherwise into the active switched profile. Without either, use the profile that
 owns it. SESSION may be a native ID or exact native name. When omitted or
 ambiguous, rtr opens the conversation picker. Arguments after -- are passed to
 the native tool.")]
@@ -221,7 +222,8 @@ the native tool.")]
 Resume a native Claude Code or Codex conversation in the isolated profile that
 owns it. SESSION may be a native ID or exact native name. When omitted or
 ambiguous, rtr opens the conversation picker. Arguments after -- are passed to
-the native tool.")]
+the native tool. --into is rejected; use rtr fork to continue in another
+profile.")]
     Resume(ConversationOpenArgs),
     /// Render one bounded transcript preview for the interactive picker.
     #[command(name = "conversation-preview", hide = true)]
@@ -323,6 +325,9 @@ pub struct SessionsArgs {
     /// Restrict results to one configured rtr profile name.
     #[arg(short = 'p', long)]
     pub profile: Option<String>,
+    /// Fork picker selections into this profile instead of the active profile.
+    #[arg(long)]
+    pub into: Option<String>,
     /// Restrict results to conversations created in the current directory.
     #[arg(long)]
     pub here: bool,
@@ -347,6 +352,9 @@ pub struct ConversationOpenArgs {
     /// Restrict lookup to one configured rtr profile name.
     #[arg(short = 'p', long)]
     pub profile: Option<String>,
+    /// Fork destination; --into is rejected by rtr resume.
+    #[arg(long)]
+    pub into: Option<String>,
     /// Restrict lookup to conversations created in the current directory.
     #[arg(long)]
     pub here: bool,
@@ -631,6 +639,30 @@ mod tests {
     }
 
     #[test]
+    fn tests_that_fork_destinations_parse_for_direct_and_picker_flows() {
+        match parse_from(["fork", "native-id", "--into", "nit"]).cmd {
+            Cmd::Fork(args) => assert_eq!(args.into.as_deref(), Some("nit")),
+            other => panic!("expected fork, got {other:?}"),
+        }
+
+        match parse_from(["sessions", "--into", "work"]).cmd {
+            Cmd::Sessions(args) => assert_eq!(args.into.as_deref(), Some("work")),
+            other => panic!("expected sessions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tests_that_conversation_help_explains_fork_targets_and_resume_ownership() {
+        let fork = help_for(&["fork"]);
+        assert!(fork.contains("active switched profile"), "{fork}");
+        assert!(fork.contains("--into"), "{fork}");
+
+        let resume = help_for(&["resume"]);
+        assert!(resume.contains("owns it"), "{resume}");
+        assert!(resume.contains("--into is rejected"), "{resume}");
+    }
+
+    #[test]
     fn slash_profile_command_arguments_are_rejected() {
         for args in [
             ["enable", "codex/personal"],
@@ -737,7 +769,8 @@ mod tests {
         assert!(sessions.contains("--json"), "{sessions}");
 
         let fork = help_for(&["fork"]);
-        assert!(fork.contains("isolated profile"), "{fork}");
+        assert!(fork.contains("active switched profile"), "{fork}");
+        assert!(fork.contains("--into"), "{fork}");
         assert!(fork.contains("owns it"), "{fork}");
         assert!(fork.contains("native ID or exact native name"), "{fork}");
         assert!(fork.contains("Arguments after --"), "{fork}");

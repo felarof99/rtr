@@ -13,10 +13,12 @@ use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
 use crate::cli::{ConversationOpenArgs, SessionsArgs};
+use crate::config::Config;
 use crate::conversations::{
     self, Catalog, Conversation, ConversationKey, ConversationQuery, OpenMode,
 };
 use crate::paths::Paths;
+use crate::switch;
 
 pub async fn run_sessions(paths: &Paths, args: SessionsArgs) -> Result<i32> {
     let catalog = conversations::query(paths, &query_for(&args)?)?;
@@ -33,7 +35,7 @@ pub async fn run_sessions(paths: &Paths, args: SessionsArgs) -> Result<i32> {
     let Some((conversation, mode)) = pick(&catalog, args.query.as_deref())? else {
         return Ok(0);
     };
-    conversations::open(paths, &conversation, mode, &[]).await
+    open_conversation(paths, &conversation, mode, &[], args.into.as_deref()).await
 }
 
 pub async fn run_open(
@@ -41,9 +43,13 @@ pub async fn run_open(
     args: ConversationOpenArgs,
     default_mode: OpenMode,
 ) -> Result<i32> {
+    if default_mode == OpenMode::Resume && args.into.is_some() {
+        bail!("--into is only valid for forks");
+    }
     let sessions_args = SessionsArgs {
-        tool: args.tool,
-        profile: args.profile,
+        tool: args.tool.clone(),
+        profile: args.profile.clone(),
+        into: args.into.clone(),
         here: args.here,
         query: args.selector.clone(),
         list: false,
@@ -63,7 +69,43 @@ pub async fn run_open(
     let Some((conversation, mode)) = selected else {
         return Ok(0);
     };
-    conversations::open(paths, &conversation, mode, &args.args).await
+    open_conversation(paths, &conversation, mode, &args.args, args.into.as_deref()).await
+}
+
+fn target_profile(explicit: Option<&str>, active: Option<&str>, owner: &str) -> String {
+    explicit.or(active).unwrap_or(owner).to_string()
+}
+
+async fn open_conversation(
+    paths: &Paths,
+    conversation: &Conversation,
+    mode: OpenMode,
+    extra_args: &[String],
+    explicit_target: Option<&str>,
+) -> Result<i32> {
+    let target = match mode {
+        OpenMode::Fork => {
+            let active = switch::active_profile(paths, &conversation.tool)?;
+            let target = target_profile(explicit_target, active.as_deref(), &conversation.profile);
+            if target != conversation.profile {
+                let config = Config::load(&paths.config_file())?;
+                switch::validate_profile(&config, &conversation.tool, &target)?;
+            }
+            Some(target)
+        }
+        OpenMode::Resume => {
+            if let Some(active) = switch::active_profile(paths, &conversation.tool)? {
+                if active != conversation.profile {
+                    eprintln!(
+                        "rtr: resuming in {}/{} (owner); shell is switched to {} — use rtr fork to continue there",
+                        conversation.tool, conversation.profile, active
+                    );
+                }
+            }
+            None
+        }
+    };
+    conversations::open(paths, conversation, mode, extra_args, target.as_deref()).await
 }
 
 pub fn print_preview(paths: &Paths, encoded_key: &str) -> Result<()> {
@@ -404,5 +446,15 @@ mod tests {
         assert!(diagnostics.is_empty());
         assert_eq!(fields.len(), 10);
         assert_eq!(fields[9], "answer found only in the full transcript");
+    }
+
+    #[test]
+    fn tests_that_fork_target_prefers_explicit_then_active_then_owner() {
+        assert_eq!(
+            target_profile(Some("explicit"), Some("active"), "owner"),
+            "explicit"
+        );
+        assert_eq!(target_profile(None, Some("active"), "owner"), "active");
+        assert_eq!(target_profile(None, None, "owner"), "owner");
     }
 }
