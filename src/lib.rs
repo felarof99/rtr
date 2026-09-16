@@ -18,6 +18,7 @@ pub mod selection;
 pub mod state;
 pub mod tool_specs;
 pub mod usage;
+mod weights;
 
 use std::path::PathBuf;
 
@@ -148,5 +149,6 @@ pub async fn run() -> Result<()> {
         Cmd::Ls { all, output } => profile_overview::run(&paths, all, output.color.stdout()),
         Cmd::Show { tool, profile } => profiles::run_show_profile(&paths, &tool, &profile),
         Cmd::Status { tool } => profiles::print_status(&paths, tool.as_deref()),
+        Cmd::Weight(args) => weights::run(&paths, &args),
     }
 }

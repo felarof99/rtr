@@ -1,7 +1,66 @@
-use anyhow::{bail, Result};
+//! Resolve user percentages once for display and automatic selection. Allocation
+//! uses integer ratios; only presentation rounds the equal remainder. Callers
+//! own the state lock and commit a selection after native-home preparation.
+use std::collections::BTreeMap;
+
+use anyhow::{bail, Context, Result};
 
 use crate::config::Tool;
-use crate::state::State;
+use crate::state::{State, WeightedRotation};
+
+/// Exact relative shares for enabled profiles, including zero-share profiles.
+/// Disabled profiles have no entry. Empty tools remain inspectable/configurable.
+#[derive(Debug)]
+pub struct Allocation {
+    pub weights: BTreeMap<String, i64>,
+    pub total: i64,
+}
+
+impl Allocation {
+    pub fn percent(&self, profile: &str) -> Option<f64> {
+        self.weights
+            .get(profile)
+            .map(|weight| 100.0 * *weight as f64 / self.total as f64)
+    }
+}
+
+pub fn allocation(tool_name: &str, tool: &Tool) -> Result<Allocation> {
+    let enabled: Vec<_> = tool
+        .profiles
+        .iter()
+        .filter(|(_, profile)| profile.enabled)
+        .collect();
+    let fixed: i64 = enabled
+        .iter()
+        .filter_map(|(_, profile)| profile.share_percent.map(i64::from))
+        .sum();
+    let automatic = enabled
+        .iter()
+        .filter(|(_, profile)| profile.share_percent.is_none())
+        .count() as i64;
+    if fixed > 100 {
+        bail!("tool '{tool_name}' fixed shares total {fixed}%, exceeding 100%; lower a share or run `rtr weight {tool_name} --reset`");
+    }
+    if !enabled.is_empty() && automatic == 0 && fixed != 100 {
+        bail!("tool '{tool_name}' fixed shares total {fixed}% with no enabled profile to take the remainder; set shares to total 100%, enable a profile without a share, or run `rtr weight {tool_name} --reset`");
+    }
+    // Multiplying fixed shares by the number of remainder profiles expresses
+    // fractional shares exactly (25/37.5/37.5 becomes 50/75/75).
+    let scale = automatic.max(1);
+    let weights: BTreeMap<_, _> = enabled
+        .into_iter()
+        .map(|(name, profile)| {
+            (
+                name.clone(),
+                profile
+                    .share_percent
+                    .map_or(100 - fixed, |percent| i64::from(percent) * scale),
+            )
+        })
+        .collect();
+    let total = weights.values().sum();
+    Ok(Allocation { weights, total })
+}
 
 pub fn enabled_profiles(tool: &Tool) -> Vec<String> {
     tool.profiles
@@ -11,7 +70,7 @@ pub fn enabled_profiles(tool: &Tool) -> Vec<String> {
         .collect()
 }
 
-/// Choose a forced profile or advance the tool's round-robin cursor.
+/// Choose an explicit profile without consuming a slot, or advance rotation.
 pub fn select_profile(
     tool_name: &str,
     tool: &Tool,
@@ -32,9 +91,62 @@ pub fn select_profile(
     if profiles.is_empty() {
         bail!("tool '{tool_name}' has no enabled profiles");
     }
+    if tool
+        .profiles
+        .values()
+        .any(|profile| profile.enabled && profile.share_percent.is_some())
+    {
+        return select_weighted(tool_name, allocation(tool_name, tool)?, state);
+    }
+    // Returning from weighted policy starts a fresh equal cycle. Old state
+    // without weighted entries keeps its existing cursor exactly as before.
+    if state.weighted.remove(tool_name).is_some() {
+        state.set_round_robin_cursor(tool_name, 0);
+    }
     let idx = state.round_robin_cursor(tool_name) % profiles.len();
     let selected = profiles[idx].clone();
     state.set_round_robin_cursor(tool_name, (idx + 1) % profiles.len());
+    Ok(selected)
+}
+
+fn select_weighted(tool_name: &str, allocation: Allocation, state: &mut State) -> Result<String> {
+    let rotation = state.weighted.entry(tool_name.to_string()).or_default();
+    if rotation.weights != allocation.weights
+        || !rotation.scores.keys().eq(allocation.weights.keys())
+    {
+        *rotation = WeightedRotation {
+            scores: allocation
+                .weights
+                .keys()
+                .map(|name| (name.clone(), 0))
+                .collect(),
+            weights: allocation.weights,
+        };
+    }
+    // Credit accrues to each eligible profile on every automatic selection.
+    // Subtracting the total from the winner spaces its selections across time
+    // instead of clustering a profile's entire allocation into a consecutive run.
+    let mut selected: Option<(&str, i64)> = None;
+    for (name, score) in &mut rotation.scores {
+        let weight = rotation.weights[name];
+        if weight == 0 {
+            continue;
+        }
+        *score = score
+            .checked_add(weight)
+            .context("weighted scheduling score overflow")?;
+        if selected.is_none_or(|(_, best)| *score > best) {
+            selected = Some((name, *score));
+        }
+    }
+    let selected = selected
+        .context("no profile has a positive automatic share")?
+        .0
+        .to_string();
+    let score = rotation.scores.get_mut(&selected).unwrap();
+    *score = score
+        .checked_sub(allocation.total)
+        .context("weighted scheduling score overflow")?;
     Ok(selected)
 }
 
@@ -125,5 +237,106 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no profile"), "got: {err}");
+    }
+
+    #[test]
+    fn every_integer_percentage_preserves_exact_fractional_remainder_over_a_cycle() {
+        for percent in 0..=100 {
+            let mut tool = tool_with_profiles(&["a", "b", "c"]);
+            tool.profiles.get_mut("a").unwrap().share_percent = Some(percent);
+            let mut state = State::default();
+            let mut counts = BTreeMap::<String, usize>::new();
+            for _ in 0..200 {
+                *counts
+                    .entry(select_profile("codex", &tool, &mut state, None).unwrap())
+                    .or_default() += 1;
+            }
+            assert_eq!(
+                counts.get("a").copied().unwrap_or(0),
+                usize::from(percent) * 2,
+                "{percent}%"
+            );
+            for name in ["b", "c"] {
+                assert_eq!(
+                    counts.get(name).copied().unwrap_or(0),
+                    usize::from(100 - percent),
+                    "{percent}%, {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_progress_survives_serialization_and_is_independent_per_tool() {
+        let mut tool = tool_with_profiles(&["a", "b"]);
+        tool.profiles.get_mut("a").unwrap().share_percent = Some(25);
+        let mut state = State::default();
+        let mut selected = Vec::new();
+        for _ in 0..4 {
+            selected.push(select_profile("codex", &tool, &mut state, None).unwrap());
+            let serialized = toml::to_string(&state).unwrap();
+            assert_eq!(
+                select_profile("codex", &tool, &mut state, Some("a")).unwrap(),
+                "a"
+            );
+            assert_eq!(toml::to_string(&state).unwrap(), serialized);
+            state = toml::from_str(&serialized).unwrap();
+        }
+        assert_eq!(selected, ["b", "a", "b", "b"]);
+        assert_eq!(
+            select_profile("claude", &tool, &mut state, None).unwrap(),
+            "b"
+        );
+        assert_eq!(
+            select_profile("claude", &tool, &mut state, None).unwrap(),
+            "a"
+        );
+        assert_eq!(
+            select_profile("codex", &tool, &mut state, None).unwrap(),
+            "b"
+        );
+    }
+
+    #[test]
+    fn policy_changes_discard_old_credit_and_reset_returns_to_equal_rotation() {
+        let mut tool = tool_with_profiles(&["a", "b", "c"]);
+        let mut state = State::default();
+        state.set_round_robin_cursor("codex", 2);
+        tool.profiles.get_mut("a").unwrap().share_percent = Some(25);
+        select_profile("codex", &tool, &mut state, None).unwrap();
+        tool.profiles.remove("c");
+        let new_first = select_profile("codex", &tool, &mut state, None).unwrap();
+        assert_eq!(
+            new_first,
+            select_profile("codex", &tool, &mut State::default(), None).unwrap()
+        );
+        assert!(!state.weighted["codex"].weights.contains_key("c"));
+        tool.profiles.get_mut("a").unwrap().share_percent = None;
+        assert_eq!(
+            select_profile("codex", &tool, &mut state, None).unwrap(),
+            "a"
+        );
+        assert!(state.weighted.is_empty());
+        assert_eq!(
+            select_profile("codex", &tool, &mut state, None).unwrap(),
+            "b"
+        );
+    }
+
+    #[test]
+    fn incomplete_or_excessive_fixed_allocations_do_not_advance_state() {
+        let mut tool = tool_with_profiles(&["a", "b"]);
+        tool.profiles.get_mut("a").unwrap().share_percent = Some(25);
+        let mut state = State::default();
+        select_profile("codex", &tool, &mut state, None).unwrap();
+        let before = toml::to_string(&state).unwrap();
+        for percent in [0, 25, 80, 100] {
+            tool.profiles.get_mut("b").unwrap().share_percent = Some(percent);
+            assert!(select_profile("codex", &tool, &mut state, None).is_err());
+            assert_eq!(toml::to_string(&state).unwrap(), before);
+            assert!(select_profile("codex", &tool, &mut state, Some("a")).is_ok());
+        }
+        tool.profiles.get_mut("b").unwrap().share_percent = Some(75);
+        assert!(select_profile("codex", &tool, &mut state, None).is_ok());
     }
 }

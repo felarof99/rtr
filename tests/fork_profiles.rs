@@ -112,6 +112,41 @@ impl Fixture {
 }
 
 #[test]
+fn weighted_forks_and_launches_share_progress_while_explicit_runs_and_resumes_preserve_it() {
+    for tool in ["codex", "claude"] {
+        let f = Fixture::new(tool);
+        f.run(&["weight", tool, "--profile", "a", "25"]);
+        // With a=25 and b=75, deterministic selection is b,a,b,b.
+        f.run(&[tool]);
+        let before = std::fs::read(f.paths.state_file()).unwrap();
+        f.run(&[
+            "fork",
+            "source-id",
+            "--tool",
+            tool,
+            "--profile",
+            "a",
+            "--to-profile",
+            "b",
+        ]);
+        assert_eq!(std::fs::read(f.paths.state_file()).unwrap(), before);
+        f.run(&["resume", "source-id", "--tool", tool, "--profile", "a"]);
+        assert_eq!(std::fs::read(f.paths.state_file()).unwrap(), before);
+        for _ in 0..3 {
+            f.run(&["fork", "source-id", "--tool", tool, "--profile", "a"]);
+        }
+        let events = rtr::usage::read_events(&f.paths.usage_file()).unwrap();
+        let automatic: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i == 0 || *i >= 3)
+            .map(|(_, event)| event.profile.as_str())
+            .collect();
+        assert_eq!(automatic, ["b", "a", "b", "b"]);
+    }
+}
+
+#[test]
 fn fork_and_normal_launch_share_rotation_but_explicit_destination_and_resume_do_not() {
     for tool in ["codex", "claude"] {
         let f = Fixture::new(tool);

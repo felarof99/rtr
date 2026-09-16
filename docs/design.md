@@ -70,7 +70,7 @@ transcripts are not resumable top-level conversations and are excluded.
 
 Resume uses the native command in the exact original isolated home. Disabled and
 normally bypassed source profiles remain recoverable without changing rotation.
-Fork selects a destination through normal enabled-profile round-robin selection;
+Fork selects a destination through normal enabled-profile share allocation;
 optional `--to-profile` forces an enabled destination without moving the cursor.
 `--profile` continues to select the source. The recorded cwd is restored when it
 still exists, and forks always use isolated homes despite ordinary bypass policy.
@@ -144,12 +144,27 @@ Codex's generated `.system` cache, and rolls back if staged installation fails.
 ## State and Concurrency
 
 Config remains hand-editable and is never rewritten during launch. Mutable
-round-robin cursors live in `state.toml`; usage events live in `usage.jsonl`.
+round-robin cursors and weighted scores live in `state.toml`; usage events live in `usage.jsonl`.
 Both use advisory locks, and state replacement is atomic.
 
+Percentage overrides are fixed shares of automatic selections; unassigned
+enabled profiles split the remainder equally. The scheduler uses exact integer
+ratios and smooth weighted rotation to avoid random streaks. Its persisted
+allocation detects policy changes and discards stale scheduling credit under
+the state lock. All-default tools retain the existing equal-rotation cursor.
+Explicit launches, resumes, and inspection do not change automatic progress.
+
+The weight command serializes lossless percentage edits under the config lock,
+validates the resulting allocation before writing, and prints that transaction's
+distribution. Disabled profiles retain settings but receive no automatic share;
+zero-share enabled profiles remain available explicitly. Incomplete or excessive
+fixed totals are reported instead of silently inflating a low-quota profile's
+share. Reset removes all overrides for a tool, including disabled profiles.
+
 Profile-table removal preserves unrelated comments, formatting, and quoted
-keys. A cursor larger than the remaining enabled profile count is normalized by
-the selector's modulo operation, so profile deletion needs no state rewrite.
+keys. Equal rotation normalizes stale cursors by modulo; weighted rotation
+detects the changed allocation. Profile deletion needs no state rewrite, but
+removing the last profile without an override can leave fixed totals incomplete.
 
 Native-home path segments are encoded before joining. Directory creation
 rejects symlink components and tightens permissions to `0700`.
@@ -157,5 +172,5 @@ rejects symlink components and tightens permissions to `0700`.
 ## Configuration Philosophy
 
 The schema contains only behavior the launcher uses: commands, skills sources,
-profiles, and profile enablement. Unknown fields fail deserialization so stale
+profiles, profile enablement, and percentage shares. Unknown fields fail deserialization so stale
 or misspelled settings cannot look active while doing nothing.

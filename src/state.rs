@@ -1,4 +1,4 @@
-//! `state.toml`: round-robin cursors for automatic profile selection.
+//! `state.toml`: equal-rotation cursors and weighted scheduling progress.
 //!
 //! Kept separate from `config.toml` so launches never rewrite the user's
 //! hand-edited configuration.
@@ -14,6 +14,18 @@ use serde::{Deserialize, Serialize};
 pub struct State {
     #[serde(default)]
     pub round_robin: BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub weighted: BTreeMap<String, WeightedRotation>,
+}
+
+/// Smooth weighted rotation persists across CLI processes under the state lock.
+/// Keeping the allocation alongside scores lets selection discard old credit
+/// when profiles or shares change, without config edits taking the state lock.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct WeightedRotation {
+    pub weights: BTreeMap<String, i64>,
+    pub scores: BTreeMap<String, i64>,
 }
 
 impl State {

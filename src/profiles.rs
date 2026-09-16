@@ -21,6 +21,9 @@ pub fn render_profile(
         "{tool}/{profile_name}\n  enabled: {}\n  bypass: {}\n",
         profile.enabled, profile.bypass
     );
+    if let Some(percent) = profile.share_percent {
+        out.push_str(&format!("  configured share: {percent}%\n"));
+    }
     if profile.bypass {
         out.push_str(&format!(
             "  bypass effect: runs use the default {tool} home (no {native_home_env})\n"
@@ -51,6 +54,14 @@ pub fn run_show_profile(paths: &Paths, tool_name: &str, profile_name: &str) -> R
             &paths.profile_home_dir(tool_name, profile_name),
         )
     );
+    let allocation = crate::selection::allocation(tool_name, cfg.tool(tool_name)?);
+    println!(
+        "  automatic share: {}",
+        crate::weights::share_label(profile_name, profile, allocation.as_ref().ok())
+    );
+    if let Err(error) = allocation {
+        println!("  automatic selection unavailable: {error}");
+    }
     Ok(())
 }
 
@@ -87,6 +98,17 @@ pub fn set_profile_enabled(
             .with_context(|| format!("tool '{}' has no profile '{profile_name}'", spec.name))?;
         let changed = profile.enabled != enabled;
         if changed {
+            if enabled {
+                // Re-enabling restores a retained fixed share. Validate before
+                // writing so this cannot push the active allocation above 100%.
+                config
+                    .tool_mut(spec.name)?
+                    .profiles
+                    .get_mut(profile_name)
+                    .unwrap()
+                    .enabled = true;
+                crate::selection::allocation(spec.name, config.tool(spec.name)?)?;
+            }
             crate::config::set_profile_enabled_in_file(
                 &config_path,
                 &mut config,
@@ -675,7 +697,7 @@ mod tests {
             list.split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
-                .contains("personal enabled isolated 0 0"),
+                .contains("personal enabled isolated 100% 0 0"),
             "{list}"
         );
 
@@ -718,14 +740,14 @@ mod tests {
             list.split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
-                .contains("personal enabled bypassed 0 0"),
+                .contains("personal enabled bypassed 100% 0 0"),
             "{list}"
         );
         assert!(
             list.split_whitespace()
                 .collect::<Vec<_>>()
                 .join(" ")
-                .contains("work disabled bypassed 0 0"),
+                .contains("work disabled bypassed 0% 0 0"),
             "{list}"
         );
 

@@ -13,8 +13,9 @@ settings, sessions, and skills without logging in and out.
 <img src="assets/rtr-flow.svg" alt="Launch flow. Two commands enter a selector: 'rtr codex -p personal' pins a profile and leaves the cursor unchanged, while a bare 'rtr codex' takes the next enabled profile in name order and advances the cursor. The selector feeds three isolated native homes — codex/oss, codex/personal, codex/work — each with its own CODEX_HOME. The selected lane, codex/personal, continues into 'exec codex', a direct child that inherits the terminal. The native home is created and its startup files synchronized under an exclusive lock before the cursor advances. Claude profiles receive CLAUDE_CONFIG_DIR and CLAUDE_SECURESTORAGE_CONFIG_DIR instead of CODEX_HOME.">
 
 `--profile` pins a profile and leaves the rotation cursor unchanged; without it,
-rtr takes the next enabled profile in name order. Either way the profile's native
-home is prepared before the real CLI takes over the terminal.
+rtr rotates equally through enabled profiles in name order by default. Use
+`rtr weight` to set percentage shares. Either way the profile's native home is
+prepared before the real CLI takes over the terminal.
 
 ## Install
 
@@ -57,6 +58,20 @@ rtr codex
 
 When the child exits, rtr reports which profile ran and prints a copyable
 profile-bound resume command on stderr.
+
+Give a low-quota profile a smaller share of automatic launches:
+
+```bash
+rtr weight                              # show all shares
+rtr weight codex --profile nik 25        # fix nik at 25%; others split 75%
+rtr weight codex --reset                 # restore equal shares
+```
+
+Percentages are whole numbers from 0 to 100; `25%` also works. Overrides stay
+fixed while enabled profiles without an override divide the remainder equally.
+Every change prints the resulting distribution. A 0% profile remains available
+with `--profile`. These are shares of automatic launches and fork destinations,
+not token quotas or elapsed time. `rtr ls` also shows the effective `SHARE`.
 
 Use `--` when a child argument should not be parsed by rtr:
 
@@ -143,7 +158,7 @@ explicit action. With `--to-profile`, Ctrl-R is unavailable. The launch line dis
 arguments; unspecified settings are labeled as native defaults.
 
 Use `--tool`, `--profile`, or `--here` to narrow the source. Forks select the next
-enabled profile using the same round-robin cursor as normal launches. Optional
+enabled profile using the same share allocation as normal launches. Optional
 `--to-profile` chooses an enabled destination without advancing rotation. A fork
 into another profile copies native history under a fresh ID and resumes it there;
 the source stays unchanged. The menu's existing fork actions use this behavior too.
@@ -172,6 +187,9 @@ rtr enable <claude|codex> --profile <name>
 rtr disable <claude|codex> --profile <name>
 rtr bypass <claude|codex> --profile <name>
 rtr unbypass <claude|codex> --profile <name>
+rtr weight [claude|codex] [--color <auto|always|never>]
+rtr weight <claude|codex> --profile <name> <percent>
+rtr weight <claude|codex> --reset
 rtr paths [--json] [--color <auto|always|never>]
 rtr sessions [--tool <claude|codex>] [-p|--profile <name>] [--here]
              [-q|--query <text>] [--list|--json]
@@ -190,7 +208,7 @@ Counts cover the current local day by default; use `--all` for all-time usage.
 A footer tip reminds you of that option. The `FAILED` column counts non-zero or
 unavailable child exits.
 
-`ls`, `paths`, and `config` use color when stdout is a terminal. Cyan identifies
+`ls`, `weight`, `paths`, and `config` use color when stdout is a terminal. Cyan identifies
 agents and path basenames; enabled profiles are green, bypassed/missing homes
 yellow, and nonzero failure counts red. Headers and secondary text are dimmed.
 `NO_COLOR` disables automatic color when nonempty; `--color=always` or `never`
@@ -238,6 +256,13 @@ and removes the profile from explicit selection and automatic rotation until
 `rtr enable <tool> --profile <name>` restores it. You can also set
 `enabled = false` by hand.
 
+`rtr weight` persists `share_percent = 25` in a profile's table; omit the field
+to share the remainder. Disabled profiles retain their setting but receive 0%.
+Fixed enabled shares may not exceed 100%. If every enabled profile has a fixed
+share, their total must be exactly 100%; RTR reports incomplete allocations
+instead of increasing a fixed share. Use `rtr weight <tool> --reset` to remove
+all overrides, including disabled profiles' settings.
+
 `rtr bypass <tool> --profile <name>` persists `bypass = true` and keeps
 selecting the profile normally, but launches the real CLI with no native-home
 override so it uses the default Claude or Codex home. rtr does not create the
@@ -268,7 +293,7 @@ or sessions.
 |---|---|
 | `~/.config/rtr/config.toml` | Tool and profile config |
 | `~/.local/state/rtr/homes/<tool>/<profile>/` | Isolated native tool home |
-| `~/.local/state/rtr/state.toml` | Rotation cursors |
+| `~/.local/state/rtr/state.toml` | Rotation cursors and weighted scheduling progress |
 | `~/.local/state/rtr/usage.jsonl` | Launch history and exit codes |
 
 Set `RTR_CONFIG_DIR` and `RTR_STATE_DIR` to override the two base directories.

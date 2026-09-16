@@ -13,8 +13,10 @@ use crate::{
     usage::{self, Stats},
 };
 
-type Row = [(String, Tone); 6];
-const HEADERS: [&str; 6] = ["AGENT", "PROFILE", "STATE", "HOME", "RUNS", "FAILED"];
+type Row = [(String, Tone); 7];
+const HEADERS: [&str; 7] = [
+    "AGENT", "PROFILE", "STATE", "HOME", "SHARE", "RUNS", "FAILED",
+];
 
 pub fn run(paths: &Paths, all: bool, style: Style) -> Result<()> {
     let config = match Config::load(&paths.config_file()) {
@@ -59,9 +61,15 @@ pub fn run(paths: &Paths, all: bool, style: Style) -> Result<()> {
 
 pub fn render(config: &Config, stats: Option<&Stats>, label: &str, style: Style) -> String {
     let mut configured = Vec::new();
+    let mut allocation_errors = Vec::new();
     for (tool, settings) in &config.tools {
+        let allocation = crate::selection::allocation(tool, settings);
         for (name, profile) in &settings.profiles {
-            configured.push(row(tool, name, Some(profile), stats));
+            let share = crate::weights::share_label(name, profile, allocation.as_ref().ok());
+            configured.push(row(tool, name, Some(profile), stats, share));
+        }
+        if let Err(error) = allocation {
+            allocation_errors.push(error.to_string());
         }
     }
     let mut historical = Vec::new();
@@ -73,7 +81,7 @@ pub fn render(config: &Config, stats: Option<&Stats>, label: &str, style: Style)
                     .get(tool)
                     .is_some_and(|settings| settings.profiles.contains_key(name))
                 {
-                    historical.push(row(tool, name, None, Some(stats)));
+                    historical.push(row(tool, name, None, Some(stats), "-".into()));
                 }
             }
         }
@@ -113,10 +121,26 @@ pub fn render(config: &Config, stats: Option<&Stats>, label: &str, style: Style)
             style.paint("Usage unavailable; counts shown as -.", Tone::Warning)
         );
     }
+    for error in allocation_errors {
+        let _ = writeln!(
+            out,
+            "\n{}",
+            style.paint(
+                &format!("Automatic selection unavailable: {error}"),
+                Tone::Warning
+            )
+        );
+    }
     out
 }
 
-fn row(tool: &str, name: &str, profile: Option<&Profile>, stats: Option<&Stats>) -> Row {
+fn row(
+    tool: &str,
+    name: &str,
+    profile: Option<&Profile>,
+    stats: Option<&Stats>,
+    share: String,
+) -> Row {
     let (state, state_tone, home, home_tone) = match profile {
         Some(profile) => (
             if profile.enabled {
@@ -150,6 +174,7 @@ fn row(tool: &str, name: &str, profile: Option<&Profile>, stats: Option<&Stats>)
         (name.into(), Tone::Strong),
         (state.into(), state_tone),
         (home.into(), home_tone),
+        (share, Tone::Accent),
         (
             if stats.is_some() {
                 runs.to_string()
@@ -173,7 +198,7 @@ fn row(tool: &str, name: &str, profile: Option<&Profile>, stats: Option<&Stats>)
     ]
 }
 
-fn table(out: &mut String, rows: &[Row], widths: [usize; 6], style: Style) {
+fn table(out: &mut String, rows: &[Row], widths: [usize; 7], style: Style) {
     let header = HEADERS
         .iter()
         .enumerate()
@@ -225,20 +250,23 @@ mod tests {
         let stats = usage::aggregate(&events, None);
         let rendered = render(&config(), Some(&stats), "all time", Style::default());
         let flat = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(flat.contains("busy enabled bypassed 2 1"), "{rendered}");
-        assert!(flat.contains("idle disabled isolated 0 0"), "{rendered}");
+        assert!(
+            flat.contains("busy enabled bypassed 100% 2 1"),
+            "{rendered}"
+        );
+        assert!(flat.contains("idle disabled isolated 0% 0 0"), "{rendered}");
         let history = flat
             .split_once("Removed profiles · recorded usage")
             .unwrap()
             .1;
-        assert!(history.contains("removed removed - 1 1"), "{rendered}");
+        assert!(history.contains("removed removed - - 1 1"), "{rendered}");
         assert!(!history.contains("busy"), "{rendered}");
 
         let empty_day =
             usage::aggregate(&events, Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()));
         let today = render(&config(), Some(&empty_day), "today", Style::default());
         let flat = today.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(flat.contains("busy enabled bypassed 0 0"), "{today}");
+        assert!(flat.contains("busy enabled bypassed 100% 0 0"), "{today}");
         assert!(!today.contains("Removed profiles"), "{today}");
     }
 
@@ -246,7 +274,10 @@ mod tests {
     fn unavailable_usage_does_not_claim_zero_runs() {
         let rendered = render(&config(), None, "today", Style::default());
         let flat = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(flat.contains("busy enabled bypassed - -"), "{rendered}");
+        assert!(
+            flat.contains("busy enabled bypassed 100% - -"),
+            "{rendered}"
+        );
         assert!(rendered.contains("Usage unavailable"));
     }
 }

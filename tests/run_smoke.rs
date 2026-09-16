@@ -969,12 +969,12 @@ fn profile_overview_filters_usage_by_day_and_preserves_history_without_config() 
     };
     let all = run(&["ls", "--all"]);
     assert!(all.starts_with("rtr profiles · all time"), "{all}");
-    assert!(all.contains("work enabled isolated 2 1"), "{all}");
-    assert!(all.contains("idle enabled isolated 0 0"), "{all}");
-    assert!(all.contains("removed removed - 1 1"), "{all}");
+    assert!(all.contains("work enabled isolated 50% 2 1"), "{all}");
+    assert!(all.contains("idle enabled isolated 50% 0 0"), "{all}");
+    assert!(all.contains("removed removed - - 1 1"), "{all}");
     let today = run(&["ls"]);
     assert!(today.starts_with("rtr profiles · today"), "{today}");
-    assert!(today.contains("work enabled isolated 1 0"), "{today}");
+    assert!(today.contains("work enabled isolated 50% 1 0"), "{today}");
     assert!(!today.contains("Removed profiles"), "{today}");
     assert!(
         today.ends_with("Tip: rtr ls --all shows all-time usage."),
@@ -983,7 +983,7 @@ fn profile_overview_filters_usage_by_day_and_preserves_history_without_config() 
     std::fs::remove_file(paths.config_file()).unwrap();
     let history = run(&["ls", "--all"]);
     assert!(history.contains("No configured profiles."), "{history}");
-    assert!(history.contains("work removed - 2 1"), "{history}");
+    assert!(history.contains("work removed - - 2 1"), "{history}");
 }
 
 #[test]

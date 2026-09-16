@@ -25,6 +25,11 @@ Pause a profile and bring it back later:
   rtr disable codex --profile personal
   rtr enable codex --profile personal
 
+Set automatic launch shares in percentages:
+  rtr weight
+  rtr weight codex --profile personal 25
+  rtr weight codex --reset
+
 Bypass a broken profile home and restore isolation:
   rtr bypass codex --profile personal
   rtr unbypass codex --profile personal
@@ -71,16 +76,16 @@ pub enum Cmd {
 Launch Claude Code in one configured profile.
 
 With --profile, rtr uses that profile and leaves rotation unchanged. Without
---profile, rtr uses the next enabled Claude profile. Remaining arguments are
-passed to Claude Code.")]
+--profile, rtr uses the next enabled Claude profile according to rtr weight shares.
+Remaining arguments are passed to Claude Code.")]
     Claude(ToolRunArgs),
     /// Launch Codex with a selected subscription profile.
     #[command(long_about = "\
 Launch Codex in one configured profile.
 
 With --profile, rtr uses that profile and leaves rotation unchanged. Without
---profile, rtr uses the next enabled Codex profile. Remaining arguments are
-passed to Codex.")]
+--profile, rtr uses the next enabled Codex profile according to rtr weight shares.
+Remaining arguments are passed to Codex.")]
     Codex(ToolRunArgs),
     /// Create a Claude/Codex profile and launch the tool to sign in.
     Add {
@@ -213,7 +218,7 @@ Alt-H changes directory scope; Alt-T / Alt-A cycle agent / profile. F1 shows hel
     /// Fork an exact native conversation, or choose one interactively.
     #[command(long_about = "\
 Fork a native Claude Code or Codex conversation into the next enabled profile,
-using the same round-robin as normal launches. --to-profile pins the destination
+using the same share allocation as normal launches. --to-profile pins the destination
 without advancing rotation; --profile filters the source. A different profile
 receives an independent copy of the conversation in its isolated home.
 
@@ -251,6 +256,46 @@ the native tool. Enter resumes; Ctrl-F forks explicitly.")]
     },
     /// Show configured tools and profiles.
     Status { tool: Option<String> },
+    /// Show or change automatic launch shares in percentages.
+    #[command(long_about = "\
+Show or change automatic launch shares. Profiles share equally by default.
+
+Set a whole percentage from 0 to 100 with --profile NAME PERCENT (25 and 25%
+are equivalent). Other profiles without an override divide the remainder
+equally. Fixed shares stay fixed when another share changes. A zero share
+allows explicit --profile launches but excludes automatic selection.
+
+With no arguments, show all tools; with TOOL, show that tool. --reset removes
+all percentage overrides for the tool, restoring equal shares. Changes apply
+to future automatic launches and forks, not running sessions or quota usage.")]
+    Weight(WeightArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct WeightArgs {
+    /// Tool to inspect or change: claude or codex.
+    pub tool: Option<String>,
+    /// Whole percentage, optionally followed by %.
+    #[arg(value_parser = parse_percent, requires_all = ["tool", "profile"])]
+    pub percent: Option<u8>,
+    /// Profile whose automatic share should change.
+    #[arg(short, long, requires_all = ["tool", "percent"])]
+    pub profile: Option<String>,
+    /// Restore equal shares by removing all overrides for this tool.
+    #[arg(long, requires = "tool", conflicts_with_all = ["profile", "percent"])]
+    pub reset: bool,
+    #[command(flatten)]
+    pub output: ColorArgs,
+}
+
+fn parse_percent(value: &str) -> std::result::Result<u8, String> {
+    let digits = value.strip_suffix('%').unwrap_or(value);
+    if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        if let Ok(percent @ 0..=100) = digits.parse::<u8>() {
+            return Ok(percent);
+        }
+    }
+    Err("expected a whole percentage from 0 to 100 (for example: 25 or 25%)".into())
 }
 
 #[derive(Subcommand, Debug)]

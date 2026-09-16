@@ -40,6 +40,8 @@ pub struct CopyMapping {
     pub destination: PathBuf,
 }
 
+/// Persistent launch policy for one native home. An absent share participates
+/// in the equal remainder; zero share keeps the profile available for explicit use.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
@@ -47,6 +49,8 @@ pub struct Profile {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub bypass: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_percent: Option<u8>,
 }
 
 impl Default for Profile {
@@ -54,6 +58,7 @@ impl Default for Profile {
         Self {
             enabled: true,
             bypass: false,
+            share_percent: None,
         }
     }
 }
@@ -87,7 +92,17 @@ impl Config {
                     "tool '{name}' cannot set both 'skills_source' and 'copy'; use 'copy' for all startup mappings"
                 );
             }
+            for (profile_name, profile) in &tool.profiles {
+                if profile.share_percent.is_some_and(|percent| percent > 100) {
+                    bail!(
+                        "profile '{name}/{profile_name}' share_percent must be between 0 and 100"
+                    );
+                }
+            }
         }
+        // Aggregate shares are validated by selection and allocation edits.
+        // Disabling/removing profiles can leave an incomplete allocation, and
+        // inspection, explicit launches, and reset must remain available then.
         Ok(config)
     }
 
@@ -312,6 +327,71 @@ fn edit_profile_flag(
         }
     }
     Some(doc.to_string())
+}
+
+/// Edit percentage overrides as one transaction. The caller holds the config
+/// lock across loading and writing, so concurrent profile edits cannot be lost.
+/// None resets the tool, including disabled profiles; scheduler state is owned
+/// by selection and reconciles this policy on the next automatic launch.
+pub fn set_profile_shares_in_file(
+    path: &Path,
+    config: &mut Config,
+    tool_name: &str,
+    setting: Option<(&str, u8)>,
+) -> Result<()> {
+    let mut updated_config = config.clone();
+    let tool = updated_config.tool_mut(tool_name)?;
+    let names = if let Some((name, percent)) = setting {
+        if percent > 100 {
+            bail!("share must be a whole percentage between 0 and 100");
+        }
+        tool.profiles
+            .get_mut(name)
+            .with_context(|| format!("tool '{tool_name}' has no profile '{name}'"))?
+            .share_percent = Some(percent);
+        vec![name.to_string()]
+    } else {
+        for profile in tool.profiles.values_mut() {
+            profile.share_percent = None;
+        }
+        tool.profiles.keys().cloned().collect()
+    };
+    crate::selection::allocation(tool_name, tool)?;
+
+    let current =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut =
+        current.parse().context("parsing config for share edits")?;
+    for name in names {
+        let profile = doc
+            .get_mut("tools")
+            .and_then(|tools| tools.as_table_like_mut()?.get_mut(tool_name))
+            .and_then(|tool| tool.as_table_like_mut()?.get_mut("profiles"))
+            .and_then(|profiles| profiles.as_table_like_mut()?.get_mut(&name))
+            .and_then(|profile| profile.as_table_like_mut())
+            .with_context(|| {
+                format!("could not locate profile {tool_name}/{name} in config.toml")
+            })?;
+        if let Some((_, percent)) = setting {
+            let mut value = toml_edit::Value::from(i64::from(percent));
+            if let Some(existing) = profile
+                .get("share_percent")
+                .and_then(|item| item.as_value())
+            {
+                *value.decor_mut() = existing.decor().clone();
+            }
+            profile.insert("share_percent", toml_edit::Item::Value(value));
+        } else {
+            profile.remove("share_percent");
+        }
+    }
+    let updated = doc.to_string();
+    Config::parse(&updated)?;
+    if updated != current {
+        write_config_file(path, &updated)?;
+    }
+    *config = updated_config;
+    Ok(())
 }
 
 fn toml_key_segment(value: &str) -> String {

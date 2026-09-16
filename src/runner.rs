@@ -42,7 +42,7 @@ impl PreparedForkRun {
     }
 }
 
-/// Forks share normal launches' enabled-profile cursor, but always use an
+/// Forks share normal launches' equal/weighted scheduling state, but always use an
 /// isolated home: ordinary bypass policy cannot redirect stored conversation IDs.
 pub(crate) fn prepare_fork_run(
     paths: &Paths,

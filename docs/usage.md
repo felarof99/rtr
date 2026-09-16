@@ -155,8 +155,8 @@ rtr codex -p personal -- --profile child-profile
 
 ## Automatic Rotation
 
-Without `--profile`, rtr chooses enabled profiles in lexicographic order and
-advances a per-tool cursor:
+Without `--profile`, rtr shares launches equally among enabled profiles by
+default, choosing them in lexicographic order and advancing a per-tool cursor:
 
 ```bash
 rtr codex
@@ -167,6 +167,48 @@ rtr codex
 A forced profile does not move that cursor. Profile preparation completes
 before a cursor update is saved, so an invalid skills source does not consume a
 turn.
+
+To give a low-quota profile a smaller share, set its percentage:
+
+```bash
+rtr weight
+rtr weight codex
+rtr weight codex --profile nik 25
+rtr weight codex --reset
+```
+
+`weight` without a tool shows every tool; with a tool it shows just that tool.
+Each edit prints the resulting allocation. Enter a whole percentage from 0 to
+100; an optional `%` suffix is accepted. Profiles without an override split the
+remainder equally, and percentages already set stay fixed:
+
+| Action | nik | eng | work |
+|---|---:|---:|---:|
+| Default | 33.33% | 33.33% | 33.33% |
+| Set nik to 25% | 25% | 37.5% | 37.5% |
+| Set eng to 50% | 25% | 50% | 25% |
+
+The table identifies settings as `fixed` or `remainder`. Computed shares are
+rounded to two decimal places for display; scheduling uses exact ratios.
+Automatic launches and fork destinations share a persistent weighted schedule,
+so separate and concurrent RTR processes honor the same distribution. These
+percentages do not cap token usage, session duration, or subscription quota.
+Explicit `--profile`, explicit fork destinations, and resumes do not consume an
+automatic slot. Existing sessions keep running in their original profiles.
+
+An override is stored as `share_percent = 25` in the profile's TOML table.
+`--reset` removes every override for the tool, including disabled profiles, and
+restores equal shares. There is no `auto` argument. A 0% profile gets no automatic
+launches but remains usable with explicit `--profile`; disabling it also blocks
+explicit launches. Disabled profiles keep their override but take no share.
+
+Enabled fixed shares may not exceed 100%. When all enabled profiles have fixed
+shares, they must total exactly 100%. For example, a lone enabled profile fixed
+at 25% cannot absorb the missing 75%. Automatic selection reports an error;
+reset the tool, adjust the percentages, or enable a profile without an override.
+Disabling or removing profiles is still allowed if it leaves an incomplete
+allocation. `weight` and `ls` display the issue and explicit launches still work.
+Re-enabling validates the resulting allocation before changing configuration.
 
 ## Exit Summary and Resume
 
@@ -263,7 +305,7 @@ picker with that text as its initial query. `--tool`, `--profile`, and `--here`
 filter discovery; arguments after `--` are appended to the native resume/fork
 invocation.
 
-Forks select the next enabled destination with the same round-robin cursor as
+Forks select the next enabled destination with the same share allocation as
 normal launches. `--profile` filters the **source**; optional `--to-profile`
 chooses an enabled **destination** without advancing that cursor. Rotation may
 select the source again, especially when only one profile is enabled. The
@@ -336,7 +378,8 @@ rtr enable codex --profile personal
 
 Disabling flips only `enabled = false` in config.toml, preserving hand-written
 comments. The profile's native home, sign-in, skills, usage history, and the
-rotation cursor stay untouched, so re-enabling restores it exactly as it was.
+stored share stay untouched. The next automatic selection reconciles any change
+to the allocation; re-enabling validates the profile's retained share.
 Disabled profiles are skipped by rotation and rejected by `--profile`.
 
 Both commands are idempotent: repeating one reports the current state and
@@ -445,7 +488,9 @@ rtr status codex
 ```
 
 `ls` shows agent, profile, enabled/disabled state, isolated/bypassed home policy,
-recorded runs, and failed exits in one table. Counts cover the current local day
+automatic `SHARE`, recorded runs, and failed exits in one table. Shares describe
+current policy; run counts also include explicit launches and resumes.
+Counts cover the current local day
 by default; `--all` includes all-time usage. The default view ends with a tip
 about `--all`. Configured profiles without usage show zero. Usage for removed
 profiles appears in a separate section, including when the config file no longer
@@ -459,7 +504,7 @@ its effect, and the isolated native-home environment variable and resolved path.
 `status` prints every configured profile beside its resolved isolated native-home
 directory, including disabled profiles, without creating missing homes.
 
-`ls`, `paths`, and `config` share `--color=auto|always|never`. Automatic color is
+`ls`, `weight`, `paths`, and `config` share `--color=auto|always|never`. Automatic color is
 enabled only when stdout is a terminal, `TERM` is not `dumb`, and `NO_COLOR` is
 unset or empty. An explicit `always` or `never` overrides that automatic policy.
 These options belong to the inspection commands; native agent arguments keep
@@ -545,7 +590,7 @@ The defaults are:
 |---|---|
 | `~/.config/rtr/config.toml` | Tool and profile configuration |
 | `~/.local/state/rtr/homes/<tool>/<profile>/` | Isolated native tool home |
-| `~/.local/state/rtr/state.toml` | Round-robin cursors |
+| `~/.local/state/rtr/state.toml` | Equal-rotation cursors and weighted scheduling progress |
 | `~/.local/state/rtr/usage.jsonl` | Per-launch tool, profile, timestamp, exit code, and bypass marker when active |
 
 ## Errors

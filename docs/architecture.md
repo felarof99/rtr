@@ -12,8 +12,9 @@
 | `conversation_command` | Human/JSON rendering and direct-open versus picker dispatch |
 | `picker` | Terminal input/layout, background dialogue search, preview excerpts, and launch descriptions |
 | `tool_specs` | Native-home variables and skills relocation policy per tool |
-| `selection` | Enabled-profile validation and round-robin choice |
-| `state` | Locked, atomic round-robin cursor persistence |
+| `selection` | Exact percentage allocation, enabled-profile validation, and equal/weighted rotation |
+| `state` | Locked, atomic rotation cursor and weighted score persistence |
+| `weights` | Percentage CLI transactions and shared allocation presentation |
 | `paths` | Config/state resolution, private directories, safe profile paths |
 | `runner` | Profile creation/repair, native-home preparation, skills refresh, direct child execution |
 | `profiles` | Profile show/status, policy changes, and confirmed exact-home removal |
@@ -41,6 +42,21 @@ closure returns the prepared immutable arguments and environment; state is
 saved only when that closure succeeds. Child execution happens after releasing
 the state lock so a long-running CLI does not block another profile launch.
 
+Profiles without `share_percent` divide the remainder after enabled fixed
+percentages are allocated. The resolver uses integer ratios, so rounding in
+displayed percentages never biases selection. Tools without enabled overrides
+retain the legacy round-robin path and cursor. With overrides, smooth weighted
+round-robin adds each profile's weight to its score, chooses the highest score
+(name order breaks ties), and subtracts total weight from the winner.
+
+The per-tool weighted state stores both allocation and scores. A changed
+allocation starts fresh credit on the next selection; removing all enabled
+overrides starts a fresh equal cycle. Config commands hold only the config lock
+and never rewrite scheduler state. Normal launches and forks share progress;
+explicit selections and resumes never advance it. Inspection uses the same
+resolver without touching state. Disabled profiles retain settings but have no
+allocation, and zero-share enabled profiles can still be selected explicitly.
+
 Conversation opens resolve the source before applying operation-specific policy:
 
 ```text
@@ -63,7 +79,7 @@ The catalog identity is `(tool, profile, native session ID)`. A direct native
 name can resolve that identity, but mutable display titles never replace it.
 Resume bypasses selection, rotation, and ordinary `enabled` / `bypass` policy
 because the recorded home is part of native identity. Forks select enabled
-destinations, sharing the normal cursor unless `--to-profile` is supplied. Their
+destinations, sharing normal scheduling state unless `--to-profile` is supplied. Their
 prepared launches always use isolated homes, ignoring ordinary bypass policy.
 Both use shared startup sync, argument defaults, child lifecycle, and usage events.
 
