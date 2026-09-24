@@ -318,7 +318,9 @@ A bare profile name selects every tool that configures it, because a profile
 names an account rather than a tool. Use `--tool` when a profile is itself named
 `claude` or `codex`. Switching prepares the native home and runs startup copying
 exactly as a launch would, but leaves automatic rotation untouched, so a bare
-`rtr codex` still rotates as before. Disabled profiles are refused and bypassed
+`rtr codex` still rotates as before. Forks also follow rotation unless
+`--to-profile` selects a destination; they ignore the switched profile.
+Disabled profiles are refused and bypassed
 profiles are skipped, since neither has an isolated home to point at.
 
 Alongside each native home, `switch` exports `RTR_PROFILE_CLAUDE` and

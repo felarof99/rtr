@@ -15,6 +15,7 @@ impl Fixture {
         let paths = Paths {
             config_dir: root.path().join("config"),
             state_dir: root.path().join("state"),
+            home_dir: root.path().join("home"),
         };
         std::fs::create_dir_all(&paths.config_dir).unwrap();
         std::fs::write(

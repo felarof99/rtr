@@ -17,6 +17,7 @@ impl Fixture {
         let paths = Paths {
             config_dir: temp.path().join("config"),
             state_dir: temp.path().join("state"),
+            home_dir: temp.path().join("home"),
         };
         let home = paths.ensure_profile_home_dir(tool, "source").unwrap();
         let target = paths.ensure_profile_home_dir(tool, "target").unwrap();

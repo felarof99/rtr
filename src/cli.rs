@@ -731,9 +731,6 @@ mod tests {
     }
 
     #[test]
-    }
-
-    #[test]
     fn parse_switch_keeps_the_trailing_command_intact() {
         match parse_from(["switch", "nit", "claudexxx", "--resume"]).cmd {
             Cmd::Switch(args) => {

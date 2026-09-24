@@ -24,6 +24,7 @@ impl Fixture {
         let paths = Paths {
             config_dir: temp.path().join("config"),
             state_dir: temp.path().join("state"),
+            home_dir: temp.path().join("home"),
         };
         std::fs::create_dir_all(&paths.config_dir).unwrap();
         let script = temp.path().join("record.sh");

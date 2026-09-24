@@ -188,7 +188,9 @@ address a profile that is itself named `claude` or `codex`.
 
 Switching prepares the native home and runs startup copying exactly as a launch
 would. It does not touch rotation: a later bare `rtr codex` selects the same
-profile it would have before. Disabled profiles are refused, and bypassed
+profile it would have before. Forks also follow rotation unless `--to-profile`
+selects a destination; they ignore the switched profile.
+Disabled profiles are refused, and bypassed
 profiles are skipped with a note, because a bypassed profile deliberately has no
 isolated home to point at.
 
@@ -688,7 +690,7 @@ The defaults are:
 | `~/.config/rtr/config.toml` | Tool and profile configuration |
 | `~/.local/state/rtr/homes/<tool>/<profile>/` | Isolated native tool home |
 | `~/.local/state/rtr/homes/<tool>/<profile>/.rtr-inherited.json` | Which MCP servers in that home rtr inherited, and their fingerprints |
-| `~/.local/state/rtr/state.toml` | Equal-rotation cursors and weighted scheduling progress |
+| `~/.local/state/rtr/state.toml` | Equal-rotation cursors, weighted scheduling progress, and switched profiles |
 | `~/.local/state/rtr/usage.jsonl` | Per-launch tool, profile, timestamp, exit code, and bypass marker when active |
 
 ## Errors

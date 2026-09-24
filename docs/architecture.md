@@ -11,9 +11,9 @@
 | `conversation_transfer` | Independent native history copies, format adapters, asset relocation, and exclusive publication |
 | `conversation_command` | Human/JSON rendering and direct-open versus picker dispatch |
 | `picker` | Terminal input/layout, background dialogue search, preview excerpts, and launch descriptions |
-| `tool_specs` | Native-home variables and skills relocation policy, and main-config MCP location per tool |
+| `tool_specs` | Native-home variables, skills relocation policy, and main-config MCP location per tool |
 | `selection` | Exact percentage allocation, enabled-profile validation, and equal/weighted rotation |
-| `state` | Locked, atomic rotation cursor and weighted score and switched profile persistence |
+| `state` | Locked, atomic persistence of rotation cursors, weighted scores, and switched profiles |
 | `weights` | Percentage CLI transactions and shared allocation presentation |
 | `inherit` | Provenance-tracked one-way sync of shared MCP servers from each tool's main config into a profile home |
 | `paths` | Config/state resolution, private directories, safe profile paths |
